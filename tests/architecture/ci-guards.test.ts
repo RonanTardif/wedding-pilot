@@ -37,11 +37,14 @@ describe("CI workflow guardrails", () => {
     expect(build).toMatch(/grep -Eq 'ƒ \/[^\n]*build\.log/);
   });
 
-  it("smoke-tests that / renders the bundled programme, not the fallback", () => {
+  it("smoke-tests that / renders the bundled programme and venues, not the fallback", () => {
     const smoke = workflow.slice(workflow.indexOf("- name: Docker image smoke test"));
     expect(smoke).toContain("jq -r '.coupleNames' src/event-programme/adapters/outbound/event.json");
     expect(smoke).toContain('grep -qF "$couple_html" page.html');
     expect(smoke).toContain('grep -qF "Programme du jour" page.html');
+    expect(smoke).toContain("jq -r '.venues[0].name' src/venues/adapters/outbound/venues.json");
+    expect(smoke).toContain('grep -qF "$venue_html" page.html');
+    expect(smoke).toContain('grep -qF "Itinéraire" page.html');
     expect(smoke).toContain('grep -qF "momentanément indisponible" page.html');
   });
 

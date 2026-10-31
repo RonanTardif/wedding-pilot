@@ -27,8 +27,17 @@ function formatEnd(start: Date, end: Date): string {
   return nextDay ? `${timeFormat.format(end)} (+1 j)` : timeFormat.format(end);
 }
 
-/** Server component: event header and the day's timeline, with the current-or-next step highlighted. */
-export function DayProgramme({ programme }: Readonly<{ programme: DayProgrammeModel }>) {
+const NO_VENUE_NAMES: ReadonlyMap<string, string> = new Map();
+
+/**
+ * Server component: event header and the day's timeline, with the current-or-next step highlighted.
+ * `venueNameById` (supplied by the composition root) resolves a step's `venueId` to a display name;
+ * an unknown or absent `venueId` simply renders no venue.
+ */
+export function DayProgramme({
+  programme,
+  venueNameById = NO_VENUE_NAMES,
+}: Readonly<{ programme: DayProgrammeModel; venueNameById?: ReadonlyMap<string, string> }>) {
   const { highlight } = programme;
   return (
     <>
@@ -45,6 +54,7 @@ export function DayProgramme({ programme }: Readonly<{ programme: DayProgrammeMo
         <ol className="timeline">
           {programme.steps.map((step) => {
             const kind = highlight?.stepId === step.id ? highlight.kind : null;
+            const venueName = step.venueId === undefined ? undefined : venueNameById.get(step.venueId);
             return (
               <li
                 key={step.id}
@@ -55,6 +65,7 @@ export function DayProgramme({ programme }: Readonly<{ programme: DayProgrammeMo
                   <time dateTime={step.start.toISOString()}>{timeFormat.format(step.start)}</time>
                   {" – "}
                   <time dateTime={step.end.toISOString()}>{formatEnd(step.start, step.end)}</time>
+                  {venueName ? <span className="step-venue">{` · ${venueName}`}</span> : null}
                 </p>
                 <h3 className="step-title">
                   {step.title}

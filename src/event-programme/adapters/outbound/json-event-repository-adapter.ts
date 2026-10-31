@@ -6,6 +6,8 @@ import eventData from "./event.json";
 const nonEmpty = z.string().trim().min(1);
 // ISO 8601 date-time with an explicit offset (or Z), e.g. 2027-06-19T15:00:00+02:00.
 const instant = z.iso.datetime({ offset: true });
+// Opaque venue reference (kebab-case); this context never resolves it.
+const venueId = z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, "venueId must be kebab-case");
 
 const stepSchema = z
   .object({
@@ -14,6 +16,7 @@ const stepSchema = z
     start: instant,
     end: instant,
     description: nonEmpty.optional(),
+    venueId: venueId.optional(),
   })
   .refine((step) => Date.parse(step.end) > Date.parse(step.start), {
     message: "end must be after start",
@@ -54,6 +57,7 @@ export class JsonEventRepositoryAdapter implements EventRepositoryPort {
         start: new Date(step.start),
         end: new Date(step.end),
         ...(step.description === undefined ? {} : { description: step.description }),
+        ...(step.venueId === undefined ? {} : { venueId: step.venueId }),
       })),
     };
   }

@@ -17,7 +17,7 @@ const event: WeddingEvent = {
   steps: [
     { id: "party", title: "Soirée", start: new Date("2027-05-08T21:00:00+02:00"), end: new Date("2027-05-09T01:00:00+02:00") },
     { id: "welcome", title: "Accueil", start: new Date("2027-05-08T15:00:00+02:00"), end: new Date("2027-05-08T15:30:00+02:00") },
-    { id: "dinner", title: "Dîner", start: new Date("2027-05-08T19:00:00+02:00"), end: new Date("2027-05-08T21:00:00+02:00") },
+    { id: "dinner", title: "Dîner", start: new Date("2027-05-08T19:00:00+02:00"), end: new Date("2027-05-08T21:00:00+02:00"), venueId: "grange" },
   ],
 };
 
@@ -31,6 +31,12 @@ describe("getDayProgramme", () => {
     expect(programme.mainVenueLabel).toBe("Ferme des Essais");
     expect(programme.steps.map((s) => s.id)).toEqual(["welcome", "dinner", "party"]);
     expect(programme.highlight).toEqual({ stepId: "dinner", kind: "current" });
+  });
+
+  it("carries each step's optional venueId through unchanged", async () => {
+    const programme = await getDayProgramme(new Date("2027-01-01T00:00:00Z"));
+    expect(programme.steps.find((s) => s.id === "dinner")?.venueId).toBe("grange");
+    expect(programme.steps.find((s) => s.id === "welcome")).not.toHaveProperty("venueId");
   });
 
   it("highlights the first step as next before the day", async () => {
