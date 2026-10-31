@@ -1,4 +1,8 @@
-# Human review required on sensitive paths (AD: Factory acts only via PRs).
+# Human review required on sensitive paths and on the guardrails themselves.
 /infrastructure/ @RonanTardif
 /CLAUDE.md @RonanTardif
 /.claude/ @RonanTardif
+/.github/ @RonanTardif
+/scripts/ @RonanTardif
+/.dependency-cruiser.cjs @RonanTardif
+/tests/architecture/ @RonanTardif

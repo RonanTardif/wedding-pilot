@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   GITLEAKS_VERSION: 8.30.1
@@ -30,8 +30,8 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Guard - no Anthropic API key under .github
-        run: bash scripts/guard-forbidden-key.sh .github
+      - name: Guard - no Anthropic API key name anywhere in the repo
+        run: bash scripts/guard-forbidden-key.sh .
 
       - name: Secret scan (gitleaks)
         run: |

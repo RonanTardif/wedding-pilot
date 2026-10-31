@@ -20,7 +20,7 @@ describe("CI workflow guardrails", () => {
       "pnpm arch",
       "pnpm build",
       "./gitleaks git",
-      "bash scripts/guard-forbidden-key.sh .github",
+      "bash scripts/guard-forbidden-key.sh .\n",
     ]) {
       expect(workflow).toContain(step);
     }

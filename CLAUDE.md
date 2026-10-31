@@ -9,12 +9,12 @@ Each bounded context lives in `src/<context>/` with exactly these layers:
 | Layer | Role | May import |
 |-------|------|-----------|
 | `domain/` | Entities, value objects, pure domain rules | only files of its own `domain/` (relative imports). No npm package, no Node core module, no framework (`next`, `react`, `@google-cloud/*`, ...) |
-| `application/` | Use cases and ports | its own `domain/` and `application/` |
+| `application/` | Use cases and ports | its own `domain/` and `application/` (local files only, no external package) |
 | `adapters/inbound/` | Drive use cases (HTTP, server components) | its own context |
 | `adapters/outbound/` | Implement ports (storage, APIs, analytics) | its own context, external packages |
 
 - `src/app/` is the Next.js App Router shell: an inbound adapter and the **composition root**. It is the only place allowed to combine several contexts.
-- A context **never** imports another context's `domain/` or `application/`.
+- A context **never** imports any path of another context (not even its adapters), nor `src/app/`.
 - No circular dependencies; every import must resolve.
 - Rules live in `.dependency-cruiser.cjs` and run with `pnpm arch` in CI; a violation fails the PR. Do not weaken a rule to make a change pass — fix the design.
 - Current contexts: `event-programme`, `venues`.
@@ -41,7 +41,7 @@ Each bounded context lives in `src/<context>/` with exactly these layers:
 ## Hard rules
 
 - **No real data.** Names, places, dates and guests are fictional. Never copy content from other repositories (including `app-mariage-v2`).
-- **Never add `ANTHROPIC_API_KEY`** anywhere (code, config, workflows, secrets). CI fails if it appears under `.github/`.
+- **Never add an Anthropic API key** (the `ANTHROPIC` + `_API_KEY` variable, in any spelling) anywhere: code, config, workflows, secrets, docs. CI (`scripts/guard-forbidden-key.sh`) fails if the name appears anywhere in the repo.
 - Never commit secrets; CI runs a gitleaks scan.
 - CI workflows keep `permissions: contents: read`. Do not add write permissions.
-- `infrastructure/**`, `CLAUDE.md` and `.claude/**` are owned by @RonanTardif (CODEOWNERS) and need his review.
+- `infrastructure/**`, `CLAUDE.md`, `.claude/**`, `.github/**`, `scripts/**`, `.dependency-cruiser.cjs` and `tests/architecture/**` are owned by @RonanTardif (CODEOWNERS) and need his review.
