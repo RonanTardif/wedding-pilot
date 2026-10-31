@@ -135,6 +135,18 @@ jobs:
                 echo "::error::/ renders the fallback error message"
                 exit 1
               fi
+              # Usage events: no GCP credentials here, so the BigQuery sink fails softly and the route still answers 202.
+              event='{"event_type":"page_viewed","properties":{"path":"/"},"session_id":"ci-session-0001","anonymous_user_id":"ci-user-0001"}'
+              status="$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' -H 'x-atlas-traffic: synthetic' -d "$event" localhost:8080/api/events || true)"
+              if [ "$status" != "202" ]; then
+                echo "::error::POST /api/events (valid event, sink down) returned HTTP '$status', expected 202"
+                exit 1
+              fi
+              status="$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' -d '{"event_type":"unknown"}' localhost:8080/api/events || true)"
+              if [ "$status" != "400" ]; then
+                echo "::error::POST /api/events (invalid event) returned HTTP '$status', expected 400"
+                exit 1
+              fi
               exit 0
             fi
             sleep 2

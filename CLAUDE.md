@@ -17,7 +17,7 @@ Each bounded context lives in `src/<context>/` with exactly these layers:
 - A context **never** imports any path of another context (not even its adapters), nor `src/app/`.
 - No circular dependencies; every import must resolve.
 - Rules live in `.dependency-cruiser.cjs` and run with `pnpm arch` in CI; a violation fails the PR. Do not weaken a rule to make a change pass — fix the design.
-- Current contexts: `event-programme`, `venues`.
+- Current contexts: `event-programme`, `venues`, `usage-analytics`.
 
 ## Naming
 
@@ -43,7 +43,7 @@ Each bounded context lives in `src/<context>/` with exactly these layers:
 - Merged to `main` + `ci` green => `.github/workflows/deploy.yml` builds the image (tag = full git SHA), applies `infrastructure/` (Artifact Registry repo + public Cloud Run service `wedding-page`, europe-west9) and checks `GET /version`.
 - `GET /version` (`src/app/version/route.ts`) returns `{"sha": "<deployed SHA>"}` from `GIT_SHA`, or `"unknown"` locally. Keep its contract: the Factory relies on it to prove a merged SHA is live.
 - Rollback = a PR reverting the commit; CI redeploys it.
-- `infrastructure/` manages only the image repository and the Cloud Run service (+ its public invoker binding), later BigQuery tables. Never service accounts, project IAM, the `analytics` dataset or WIF: those live in the human `pilot-bootstrap` stack.
+- `infrastructure/` manages only the image repository, the Cloud Run service (+ its public invoker binding) and the BigQuery tables inside `analytics` (today `analytics.events`). Never service accounts, project IAM, the `analytics` dataset (nor its IAM) or WIF: those live in the human `pilot-bootstrap` stack.
 
 ## Hard rules
 

@@ -42,8 +42,8 @@ describe("AD-21 dependency rules (dependency-cruiser)", () => {
     ["domain-imports-application", ["domain-not-to-outer-layers", "domain-stays-in-own-domain"]],
     ["domain-imports-app", ["domain-stays-in-own-domain", "no-cross-context"]],
     ["domain-imports-next", ["domain-no-external-deps"]],
-    // Not installed, so it cannot resolve; once installed, domain-no-external-deps applies (see domain-imports-next).
-    ["domain-imports-google-cloud", ["not-to-unresolvable"]],
+    // @google-cloud/bigquery is installed (usage-analytics outbound adapter): an SDK import in domain/ is an external dep.
+    ["domain-imports-google-cloud", ["domain-no-external-deps"]],
     ["domain-imports-node-core", ["domain-no-external-deps"]],
     ["application-imports-adapter", ["application-not-to-adapters"]],
     ["application-imports-app", ["application-not-to-adapters", "no-cross-context"]],

@@ -1,7 +1,8 @@
 # Pilot CI stack, applied by pilot-deployer from .github/workflows/deploy.yml (AD-10, AD-19).
 # It manages ONLY the Artifact Registry repository, the Cloud Run service and its public
-# invoker binding (later: BigQuery tables). Never service accounts, project IAM or the
-# analytics dataset: those belong to the human pilot-bootstrap stack.
+# invoker binding, and the BigQuery tables inside the analytics dataset. Never service accounts,
+# project IAM or the analytics dataset itself (nor its IAM): those belong to the human
+# pilot-bootstrap stack.
 
 locals {
   # The image tag is the git SHA; /version reports it from GIT_SHA.
@@ -100,4 +101,34 @@ resource "google_cloud_run_v2_service_iam_member" "public" {
   name     = google_cloud_run_v2_service.wedding_page.name
   role     = "roles/run.invoker"
   member   = "allUsers"
+}
+
+# Usage events (AD-11 envelope, contracts/usage-event.v1.json), streamed by the runtime SA wedding-app.
+# The dataset `analytics` and its IAM are owned by pilot-bootstrap; only the table lives here.
+# No IP, user agent or referrer column, by design.
+resource "google_bigquery_table" "events" {
+  project     = var.project_id
+  dataset_id  = "analytics"
+  table_id    = "events"
+  description = "Pseudonymised usage events of wedding-pilot (schema_version 1)."
+
+  deletion_protection = true
+
+  time_partitioning {
+    type  = "DAY"
+    field = "occurred_at"
+  }
+
+  schema = jsonencode([
+    { name = "event_id", type = "STRING", mode = "REQUIRED", description = "evt_ + ULID" },
+    { name = "event_type", type = "STRING", mode = "REQUIRED" },
+    { name = "product_id", type = "STRING", mode = "REQUIRED" },
+    { name = "session_id", type = "STRING", mode = "REQUIRED", description = "Random opaque token (per browser tab session)" },
+    { name = "anonymous_user_id", type = "STRING", mode = "REQUIRED", description = "Random opaque token (per browser)" },
+    { name = "traffic_source", type = "STRING", mode = "REQUIRED", description = "real or synthetic" },
+    { name = "occurred_at", type = "TIMESTAMP", mode = "REQUIRED", description = "Server time, UTC" },
+    { name = "properties", type = "JSON", mode = "REQUIRED", description = "Closed schema per event_type" },
+    { name = "consent_context", type = "JSON", mode = "REQUIRED" },
+    { name = "schema_version", type = "INT64", mode = "REQUIRED" },
+  ])
 }
