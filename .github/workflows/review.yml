@@ -1,0 +1,275 @@
+name: review
+
+# ATLAS independent reviewer (story 3.2). A second claude-code-action run, distinct from the build agent,
+# reviews every PR from an `atlas/{run_id}/{mission_id}` branch of this repository and sets the commit
+# status `atlas-review`, required by the `protect-main` ruleset next to `ci`:
+#   approve          -> review posted, atlas-review = success, auto-merge (squash) enabled by the GitHub App,
+#                       unless the PR touches a CODEOWNERS path (then Ronan is asked to review, no auto-merge);
+#   request changes  -> review posted with comments, atlas-review = failure, auto-merge disabled;
+#   reviewer failure -> atlas-review = error (re-run the workflow).
+# Any other same-repo PR (human branch) gets atlas-review = success immediately: the agent review only
+# gates Factory PRs. Fork PRs get no status from this workflow.
+#
+# Trust boundaries (pull_request_target runs with this repository's secrets):
+# - The workflow, the prompt and CLAUDE.md come from the base branch (main). The PR head is checked out
+#   into `.atlas-pr/` as data only, without credentials, stripped of instruction files and symlinks.
+# - No step runs PR code: no install, no build, no test (CI does that in `ci`, without secrets).
+# - The reviewer only has read tools; the verdict comes back as structured output and is posted by this
+#   workflow with the GitHub App token, minted after the agent has finished.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+permissions: {}
+
+# A new push supersedes the review of the previous head.
+concurrency:
+  group: review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pass-through:
+    name: atlas-review (not an ATLAS branch)
+    # Same-repo PRs only: a fork PR gets no atlas-review status from this workflow (a maintainer merges it).
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !startsWith(github.event.pull_request.head.ref, 'atlas/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+    steps:
+      - name: Set atlas-review to success
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::unexpected head SHA"
+            exit 1
+          fi
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+            -f state=success -f context=atlas-review \
+            -f description="Not an ATLAS branch: no agent review required" > /dev/null
+
+  review:
+    name: review
+    if: >-
+      startsWith(github.event.pull_request.head.ref, 'atlas/') &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: atlas-agents
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    env:
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Validate the PR and set atlas-review to pending
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ && "$BASE_SHA" =~ ^[0-9a-f]{40}$ && "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "::error::unexpected pull request payload"
+            exit 1
+          fi
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          if ! [[ "$HEAD_REF" =~ ^atlas/run_[0-9A-HJKMNP-TV-Z]{26}/msn_[0-9A-HJKMNP-TV-Z]{26}$ ]]; then
+            gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+              -f state=failure -f context=atlas-review -f target_url="$run_url" \
+              -f description="Malformed ATLAS branch name (expected atlas/{run_id}/{mission_id})" > /dev/null
+            echo "::error::malformed ATLAS branch name"
+            exit 1
+          fi
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+            -f state=pending -f context=atlas-review -f target_url="$run_url" \
+            -f description="ATLAS reviewer running" > /dev/null
+
+      # Only to learn the App's bot login for `allowed_bots`: metadata read, no write access.
+      - name: Identify the GitHub App (read-only token)
+        id: identity
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.ATLAS_APP_ID }}
+          private-key: ${{ secrets.ATLAS_APP_PRIVATE_KEY }}
+          repositories: wedding-pilot
+          permission-metadata: read
+
+      # pull_request_target checks out the base branch by default: instructions come from main.
+      - name: Checkout the base branch (instructions)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout the PR head as data (never executed)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: .atlas-pr
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare the review inputs
+        id: prep
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          # Only the scratch dir is git-excluded: .atlas-pr/ must stay visible to the reviewer's Glob/Grep.
+          echo ".atlas-review/" >> .git/info/exclude
+          mkdir -p .atlas-review
+          pr_git() { git -C .atlas-pr -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"; }
+          pr_git diff --no-ext-diff --no-textconv --no-renames "$BASE_SHA...$HEAD_SHA" > .atlas-review/pr.diff
+          pr_git diff --name-only --no-renames -z "$BASE_SHA...$HEAD_SHA" | tr '\0' '\n' > .atlas-review/changed-files.txt
+          printf '%s\n' "$PR_BODY" > .atlas-review/pr-body.md
+          jq -n --arg number "$PR_NUMBER" --arg title "$PR_TITLE" --arg branch "$HEAD_REF" \
+            --arg base_sha "$BASE_SHA" --arg head_sha "$HEAD_SHA" \
+            '{number: ($number | tonumber), title: $title, branch: $branch, base: "main", base_sha: $base_sha, head_sha: $head_sha}' \
+            > .atlas-review/pr.json
+
+          # The reviewer must never read instructions from the PR branch: drop them (their changes stay
+          # visible in pr.diff), and drop symlinks that could point outside the checkout.
+          find .atlas-pr -path .atlas-pr/.git -prune -o \
+            \( -name CLAUDE.md -o -name CLAUDE.local.md -o -name .claude -o -name .mcp.json -o -name .claude.json \) \
+            -print0 | xargs -0 -r rm -rf
+          find .atlas-pr -path .atlas-pr/.git -prune -o -type l -print0 | xargs -0 -r rm -f
+
+          # Paths owned in CODEOWNERS (read from the base branch) need Ronan's review: no auto-merge.
+          mapfile -t owned < <(grep -Ev '^[[:space:]]*(#|$)' .github/CODEOWNERS | awk '{print $1}')
+          : > .atlas-review/sensitive-files.txt
+          while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            for pattern in "${owned[@]}"; do
+              p="${pattern#/}"
+              if [[ "$p" == */ ]]; then
+                [[ "$file" == "$p"* ]] && { echo "$file" >> .atlas-review/sensitive-files.txt; break; }
+              elif [[ "$file" == "$p" || "$file" == "$p/"* ]]; then
+                echo "$file" >> .atlas-review/sensitive-files.txt
+                break
+              fi
+            done
+          done < .atlas-review/changed-files.txt
+          if [ -s .atlas-review/sensitive-files.txt ]; then
+            echo "sensitive=true" >> "$GITHUB_OUTPUT"
+            echo "PR touches CODEOWNERS paths:"
+            cat .atlas-review/sensitive-files.txt
+          else
+            echo "sensitive=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          delimiter="ATLAS_PROMPT_$(openssl rand -hex 16)"
+          { echo "prompt<<$delimiter"; cat .github/atlas/review-prompt.md; echo "$delimiter"; } >> "$GITHUB_OUTPUT"
+
+      - name: Run the reviewer (Claude Code, subscription, read-only)
+        id: agent
+        continue-on-error: true
+        uses: anthropics/claude-code-action@d535f5172dec02b204866b393d6b20b9b2aaf98d # v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          allowed_bots: ${{ steps.identity.outputs.app-slug }}[bot]
+          prompt: ${{ steps.prep.outputs.prompt }}
+          claude_args: |
+            --max-turns 60
+            --allowedTools "Read,Glob,Grep"
+            --disallowedTools "Bash,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch"
+            --json-schema '{"type":"object","additionalProperties":false,"required":["verdict","summary","comments"],"properties":{"verdict":{"type":"string","enum":["approve","request_changes"]},"summary":{"type":"string"},"comments":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["path","body"],"properties":{"path":{"type":"string"},"line":{"type":"integer","minimum":1},"body":{"type":"string"}}}}}}'
+
+      # Write access exists only from here on, after the reviewer has finished.
+      - name: Mint the GitHub App token (review and merge)
+        id: app-token
+        if: steps.agent.outcome == 'success'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.ATLAS_APP_ID }}
+          private-key: ${{ secrets.ATLAS_APP_PRIVATE_KEY }}
+          repositories: wedding-pilot
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Post the verdict, set atlas-review, enable auto-merge
+        if: always() && steps.prep.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          STATUS_TOKEN: ${{ github.token }}
+          AGENT_OUTCOME: ${{ steps.agent.outcome }}
+          REVIEW_JSON: ${{ steps.agent.outputs.structured_output }}
+          SENSITIVE: ${{ steps.prep.outputs.sensitive }}
+        run: |
+          set -euo pipefail
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          set_status() {
+            GH_TOKEN="$STATUS_TOKEN" gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+              -f state="$1" -f context=atlas-review -f target_url="$run_url" -f description="$2" > /dev/null
+          }
+
+          verdict=""
+          if [ "$AGENT_OUTCOME" = "success" ] && [ -n "$GH_TOKEN" ]; then
+            verdict="$(jq -r '.verdict // empty' <<< "$REVIEW_JSON" 2> /dev/null || true)"
+          fi
+          if [ "$verdict" != "approve" ] && [ "$verdict" != "request_changes" ]; then
+            set_status error "The ATLAS reviewer did not complete: re-run the review workflow"
+            echo "::error::no valid verdict from the reviewer (agent outcome: $AGENT_OUTCOME)"
+            exit 1
+          fi
+
+          # Review body: verdict, summary, then the comments (inline ones are also attached to their line).
+          render_body() { # $1 = all | not-inline
+            jq -r --arg mode "$1" --arg run_url "$run_url" '
+              "**ATLAS review: " + (if .verdict == "approve" then "approve" else "changes requested" end)
+              + "** ([review run](" + $run_url + "))\n\n" + .summary
+              + ( [ .comments[] | select($mode == "all" or (.line == null)) ]
+                  | if length == 0 then ""
+                    else "\n\n### Comments\n\n" + (map("- `" + .path + (if .line then ":" + (.line | tostring) else "" end) + "`: " + .body) | join("\n"))
+                    end )' <<< "$REVIEW_JSON"
+          }
+          post_review() { # $1 = event, $2 = body mode, $3 = with inline comments (true|false)
+            jq -n --arg event "$1" --arg body "$(render_body "$2")" --arg commit "$HEAD_SHA" \
+              --argjson inline "$3" --argjson review "$REVIEW_JSON" \
+              '{event: $event, body: $body, commit_id: $commit}
+               + (if $inline then {comments: [ $review.comments[] | select(.line != null)
+                    | {path, line, side: "RIGHT", body} ]} else {} end)' > "$RUNNER_TEMP/atlas-review.json"
+            gh api -X POST "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews" --input "$RUNNER_TEMP/atlas-review.json" > /dev/null
+          }
+          if [ "$verdict" = "approve" ]; then event=APPROVE; else event=REQUEST_CHANGES; fi
+          # GitHub refuses inline comments outside the diff, and an approval or a change request from the
+          # PR author (the App opened the PR): fall back to a plain review, then to a comment review.
+          if post_review "$event" not-inline true || post_review "$event" all false; then
+            echo "Posted a $event review"
+          elif post_review COMMENT all false; then
+            echo "::notice::GitHub refused a $event review from the App (PR author); posted the verdict as a comment review"
+          else
+            echo "::warning::could not post the review; the atlas-review status still carries the verdict"
+          fi
+
+          if [ "$verdict" = "request_changes" ]; then
+            set_status failure "ATLAS reviewer requested changes"
+            gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --disable-auto > /dev/null 2>&1 || true
+            exit 0
+          fi
+
+          set_status success "ATLAS reviewer approved"
+          if [ "$SENSITIVE" = "true" ]; then
+            {
+              echo "The ATLAS reviewer approved this PR, but it touches paths that need @RonanTardif's review (CODEOWNERS), so it is **not** merged automatically:"
+              echo
+              # shellcheck disable=SC2016 # literal backticks (Markdown code spans)
+              sed 's/^/- `/; s/$/`/' .atlas-review/sensitive-files.txt
+            } > "$RUNNER_TEMP/atlas-sensitive.md"
+            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/atlas-sensitive.md"
+            gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --disable-auto > /dev/null 2>&1 || true
+          else
+            gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash --match-head-commit "$HEAD_SHA"
+            echo "Auto-merge (squash) enabled: merges once ci and atlas-review pass"
+          fi

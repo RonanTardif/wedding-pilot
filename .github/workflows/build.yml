@@ -1,0 +1,526 @@
+name: build
+
+# ATLAS code agent (story 3.1). The Factory orchestrator dispatches this workflow on main with a GitHub
+# App installation token (`actions` permission). Claude Code (claude-code-action, Ronan's subscription)
+# implements the mini-spec on `atlas/{run_id}/{mission_id}`; the job re-runs the quality gates, then a
+# separate job commits and pushes with the GitHub App token (so `ci` and `review` run on the PR) and opens
+# or updates the PR `[{run_id}] ...`.
+#
+# Result: `publish` job outputs and the `atlas-build-result` artifact (result.json):
+#   status = succeeded | failed | rate_limited, pr_number, head_sha, input_tokens, output_tokens, reason.
+# `rate_limited` (subscription usage limit) keeps the run green so the caller retries later.
+#
+# Trust boundaries:
+# - Dispatch inputs reach the agent only as files under `.atlas-run/` (never interpolated into a shell).
+# - Job `agent` runs everything agent-controlled (the agent, the pnpm gates, git in its workspace). It has
+#   no GitHub App secret and no environment; its GitHub token is the read-only job token. It hands over
+#   a patch, the changed-file list and the usage as an artifact.
+# - Job `publish` (environment `atlas-agents`) runs no agent-controlled code: it re-checks the patch,
+#   mints the App token, applies the patch in a fresh clone, pushes and opens or updates the PR.
+# - The App has no `workflows` permission: a change under `.github/` is refused before the push.
+run-name: build ${{ inputs.run_id }} ${{ inputs.mission_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Factory run id (run_ + ULID)"
+        required: true
+        type: string
+      mission_id:
+        description: "Mission id (msn_ + ULID)"
+        required: true
+        type: string
+      intent:
+        description: "Ronan's intention, verbatim"
+        required: true
+        type: string
+      mini_spec:
+        description: "Mini-spec to implement"
+        required: true
+        type: string
+      feedback:
+        description: "Feedback from CI or the reviewer on the previous attempt (re-dispatch on the same branch)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+# One build at a time per mission; a re-dispatch waits for the previous attempt.
+concurrency:
+  group: build-${{ inputs.run_id }}-${{ inputs.mission_id }}
+  cancel-in-progress: false
+
+env:
+  COREPACK_VERSION: 0.36.0
+  NEXT_TELEMETRY_DISABLED: "1"
+
+jobs:
+  agent:
+    name: agent
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      validated: ${{ steps.inputs.outputs.validated }}
+      branch: ${{ steps.inputs.outputs.branch }}
+      base_sha: ${{ steps.prepare.outputs.base_sha }}
+      main_sha: ${{ steps.prepare.outputs.main_sha }}
+      existing: ${{ steps.prepare.outputs.existing }}
+      agent_status: ${{ steps.usage.outputs.agent_status }}
+      input_tokens: ${{ steps.usage.outputs.input_tokens }}
+      output_tokens: ${{ steps.usage.outputs.output_tokens }}
+      changes_ok: ${{ steps.changes.outcome == 'success' }}
+    steps:
+      - name: Validate ids and write the mission inputs to files
+        id: inputs
+        env:
+          RUN_ID: ${{ inputs.run_id }}
+          MISSION_ID: ${{ inputs.mission_id }}
+          INTENT: ${{ inputs.intent }}
+          MINI_SPEC: ${{ inputs.mini_spec }}
+          FEEDBACK: ${{ inputs.feedback }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$RUN_ID" =~ ^run_[0-9A-HJKMNP-TV-Z]{26}$ ]]; then
+            echo "::error::invalid run_id (expected run_ + 26-char ULID)"
+            exit 1
+          fi
+          if ! [[ "$MISSION_ID" =~ ^msn_[0-9A-HJKMNP-TV-Z]{26}$ ]]; then
+            echo "::error::invalid mission_id (expected msn_ + 26-char ULID)"
+            exit 1
+          fi
+          if [ -z "${INTENT//[[:space:]]/}" ] || [ -z "${MINI_SPEC//[[:space:]]/}" ]; then
+            echo "::error::intent and mini_spec must not be empty"
+            exit 1
+          fi
+          dir="$RUNNER_TEMP/atlas-input"
+          mkdir -p "$dir" "$RUNNER_TEMP/atlas-out"
+          printf '%s\n' "$INTENT" > "$dir/intent.md"
+          printf '%s\n' "$MINI_SPEC" > "$dir/mini-spec.md"
+          if [ -n "${FEEDBACK//[[:space:]]/}" ]; then
+            printf '%s\n' "$FEEDBACK" > "$dir/feedback.md"
+          fi
+          echo "branch=atlas/$RUN_ID/$MISSION_ID" >> "$GITHUB_OUTPUT"
+          echo "validated=true" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare the branch, the prompt and the input files
+        id: prepare
+        env:
+          BRANCH: ${{ steps.inputs.outputs.branch }}
+        run: |
+          set -euo pipefail
+          # The prompt always comes from main, even when an existing branch is checked out below.
+          delimiter="ATLAS_PROMPT_$(openssl rand -hex 16)"
+          { echo "prompt<<$delimiter"; cat .github/atlas/build-prompt.md; echo "$delimiter"; } >> "$GITHUB_OUTPUT"
+          main_sha="$(git rev-parse HEAD)"
+          echo "main_sha=$main_sha" >> "$GITHUB_OUTPUT"
+          rc=0
+          git ls-remote --exit-code --heads origin "refs/heads/$BRANCH" > /dev/null || rc=$?
+          case "$rc" in
+            0)
+              git fetch --no-tags origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+              git checkout -B "$BRANCH" "origin/$BRANCH"
+              echo "existing=true" >> "$GITHUB_OUTPUT"
+              echo "base_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+              # Bring the branch up to date with main (publish recreates the same merge before pushing).
+              if ! git -c user.name=atlas-build -c user.email=atlas-build@localhost \
+                  merge --no-edit --no-ff "$main_sha"; then
+                git merge --abort || true
+                echo "$BRANCH conflicts with main; it cannot be updated automatically." > "$RUNNER_TEMP/atlas-out/reason.txt"
+                echo "::error::$BRANCH conflicts with main"
+                exit 1
+              fi
+              echo "Continuing on the existing branch $BRANCH, merged with main"
+              ;;
+            2)
+              git checkout -B "$BRANCH"
+              echo "existing=false" >> "$GITHUB_OUTPUT"
+              echo "base_sha=$main_sha" >> "$GITHUB_OUTPUT"
+              echo "Starting $BRANCH from main"
+              ;;
+            *)
+              echo "::error::could not query the remote branches (git ls-remote exit code $rc)"
+              exit 1
+              ;;
+          esac
+          cp -R "$RUNNER_TEMP/atlas-input" .atlas-run
+          echo ".atlas-run/" >> .git/info/exclude
+
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Enable pnpm via corepack
+        run: |
+          npm install --global "corepack@${COREPACK_VERSION}"
+          corepack enable
+          pnpm --version
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Run the code agent (Claude Code, subscription)
+        id: agent
+        continue-on-error: true
+        uses: anthropics/claude-code-action@d535f5172dec02b204866b393d6b20b9b2aaf98d # v1
+        env:
+          # Best-effort scrub of secrets from the environment of the commands the agent runs.
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          allowed_bots: ${{ vars.ATLAS_APP_SLUG }}[bot]
+          prompt: ${{ steps.prepare.outputs.prompt }}
+          claude_args: |
+            --max-turns 150
+            --allowedTools "Read,Glob,Grep,Edit,MultiEdit,Write,TodoWrite,Bash(pnpm lint),Bash(pnpm typecheck),Bash(pnpm test),Bash(pnpm test:*),Bash(pnpm arch),Bash(pnpm build)"
+            --disallowedTools "WebFetch,WebSearch,NotebookEdit"
+
+      - name: Classify the agent run and count tokens
+        id: usage
+        env:
+          AGENT_OUTCOME: ${{ steps.agent.outcome }}
+          EXECUTION_FILE: ${{ steps.agent.outputs.execution_file }}
+        run: |
+          set -euo pipefail
+          file="${EXECUTION_FILE:-$RUNNER_TEMP/claude-execution-output.json}"
+          input_tokens=0
+          output_tokens=0
+          rate_limited=false
+          if [ -f "$file" ] && jq -e 'type == "array"' "$file" > /dev/null 2>&1; then
+            input_tokens="$(jq '[.[] | select(.type == "result") | .usage.input_tokens // 0] | add // 0' "$file")"
+            output_tokens="$(jq '[.[] | select(.type == "result") | .usage.output_tokens // 0] | add // 0' "$file")"
+            # Subscription usage limit: the SDK flags the synthetic assistant message, and the error text
+            # ("Claude AI usage limit reached", "You've hit your limit · resets ...") ends up in the result.
+            if jq -e '
+                def limit_text: test("usage limit|limit reached|hit your limit|rate.?limit"; "i");
+                any(.[];
+                  (.type == "assistant" and (.error // "") == "rate_limit")
+                  or (.type == "assistant" and (.message.model // "") == "<synthetic>"
+                      and ([.message.content[]? | .text? // ""] | join(" ") | limit_text))
+                  or (.type == "result" and .is_error == true
+                      and (((.result // "") + " " + ((.errors // []) | map(tostring) | join(" "))) | limit_text)))
+              ' "$file" > /dev/null; then
+              rate_limited=true
+            fi
+          fi
+          if [ "$AGENT_OUTCOME" = "success" ]; then
+            agent_status=succeeded
+          elif [ "$rate_limited" = true ]; then
+            agent_status=rate_limited
+            echo "Claude subscription usage limit reached." > "$RUNNER_TEMP/atlas-out/reason.txt"
+          else
+            agent_status=failed
+            echo "The code agent did not complete (claude-code-action outcome: $AGENT_OUTCOME)." > "$RUNNER_TEMP/atlas-out/reason.txt"
+          fi
+          {
+            echo "agent_status=$agent_status"
+            echo "input_tokens=$input_tokens"
+            echo "output_tokens=$output_tokens"
+          } >> "$GITHUB_OUTPUT"
+          echo "agent: $agent_status, tokens in=$input_tokens out=$output_tokens"
+
+      - name: Verify the quality gates
+        id: gates
+        if: steps.usage.outputs.agent_status == 'succeeded'
+        continue-on-error: true
+        run: |
+          if ! (pnpm lint && pnpm typecheck && pnpm test && pnpm arch && pnpm build); then
+            echo "The quality gates failed after the agent run (pnpm lint && pnpm typecheck && pnpm test && pnpm arch && pnpm build)." > "$RUNNER_TEMP/atlas-out/reason.txt"
+            exit 1
+          fi
+
+      - name: Collect the change
+        id: changes
+        if: steps.gates.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/atlas-out"
+          # Hooks and fsmonitor are disabled: the workspace is agent-controlled.
+          safe_git() { git -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"; }
+          rm -rf .atlas-run
+          safe_git add -A
+          # Against HEAD: the branch head, or its merge with main (recreated by publish).
+          safe_git diff --cached --name-only --no-renames -z HEAD | tr '\0' '\n' > "$out/changed.txt"
+          if [ ! -s "$out/changed.txt" ]; then
+            echo "The agent made no change." > "$out/reason.txt"
+            echo "::error::the agent made no change"
+            exit 1
+          fi
+          if grep -E '^\.github/' "$out/changed.txt" > "$out/forbidden.txt"; then
+            { echo "The agent changed .github/, which the GitHub App cannot push:"; cat "$out/forbidden.txt"; } > "$out/reason.txt"
+            echo "::error::the agent changed .github/"
+            exit 1
+          fi
+          safe_git diff --cached --binary --no-ext-diff --no-textconv --no-renames HEAD > "$out/change.patch"
+          echo "Changed files:"
+          cat "$out/changed.txt"
+
+      - name: Hand the change over to publish
+        if: always() && steps.inputs.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: atlas-agent-output
+          path: ${{ runner.temp }}/atlas-out/
+          if-no-files-found: ignore
+          include-hidden-files: true
+          retention-days: 7
+
+  publish:
+    name: publish
+    needs: agent
+    # Runs whenever the inputs were valid, to report the result (rate_limited, failed or succeeded).
+    if: always() && needs.agent.outputs.validated == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: atlas-agents
+    permissions:
+      contents: read
+    outputs:
+      status: ${{ steps.result.outputs.status }}
+      pr_number: ${{ steps.result.outputs.pr_number }}
+      head_sha: ${{ steps.result.outputs.head_sha }}
+      input_tokens: ${{ steps.result.outputs.input_tokens }}
+      output_tokens: ${{ steps.result.outputs.output_tokens }}
+      branch: ${{ needs.agent.outputs.branch }}
+    env:
+      BRANCH: ${{ needs.agent.outputs.branch }}
+      RUN_ID: ${{ inputs.run_id }}
+      MISSION_ID: ${{ inputs.mission_id }}
+    steps:
+      - name: Get the agent output
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: atlas-agent-output
+          path: ${{ runner.temp }}/atlas-out
+
+      - name: Write the mission inputs to files
+        env:
+          INTENT: ${{ inputs.intent }}
+          FEEDBACK: ${{ inputs.feedback }}
+          MINI_SPEC: ${{ inputs.mini_spec }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/atlas-input"
+          mkdir -p "$dir" "$RUNNER_TEMP/atlas-out"
+          printf '%s\n' "$INTENT" > "$dir/intent.md"
+          printf '%s\n' "$MINI_SPEC" > "$dir/mini-spec.md"
+          if [ -n "${FEEDBACK//[[:space:]]/}" ]; then
+            printf '%s\n' "$FEEDBACK" > "$dir/feedback.md"
+          fi
+
+      - name: Mint the GitHub App token (push and pull request)
+        id: app-token
+        if: needs.agent.outputs.changes_ok == 'true' && steps.download.outcome == 'success'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.ATLAS_APP_ID }}
+          private-key: ${{ secrets.ATLAS_APP_PRIVATE_KEY }}
+          repositories: wedding-pilot
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Commit, push the branch and open or update the PR
+        id: pr
+        if: steps.app-token.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          BOT_LOGIN: ${{ steps.app-token.outputs.app-slug }}[bot]
+          BASE_SHA: ${{ needs.agent.outputs.base_sha }}
+          MAIN_SHA: ${{ needs.agent.outputs.main_sha }}
+          EXISTING: ${{ needs.agent.outputs.existing }}
+        run: |
+          set -euo pipefail
+          reason="$RUNNER_TEMP/atlas-out/reason.txt"
+          echo "Pushing or opening the pull request failed." > "$reason"
+          case "$BRANCH" in
+            atlas/*) ;;
+            *) echo "::error::refusing to push to '$BRANCH' (only atlas/ branches)"; exit 1 ;;
+          esac
+          if ! [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ && "$MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::unexpected base SHAs from the agent job"
+            exit 1
+          fi
+          input_dir="$RUNNER_TEMP/atlas-input"
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+          # Fresh clone; the patch is the only thing coming from the agent job.
+          work="$RUNNER_TEMP/atlas-push"
+          git clone --quiet --no-tags "https://github.com/$GITHUB_REPOSITORY.git" "$work"
+          cd "$work"
+          bot_id="$(gh api "users/$BOT_LOGIN" --jq .id)"
+          git config user.name "$BOT_LOGIN"
+          git config user.email "${bot_id}+${BOT_LOGIN}@users.noreply.github.com"
+          if [ "$EXISTING" = "true" ]; then
+            if [ "$(git rev-parse "origin/$BRANCH")" != "$BASE_SHA" ]; then
+              echo "$BRANCH moved during the run; re-dispatch to continue from its new head." > "$reason"
+              echo "::error::$BRANCH moved during the run"
+              exit 1
+            fi
+            git checkout --quiet -B "$BRANCH" "$BASE_SHA"
+            # Same merge as in the agent job, so the patch applies on the same tree.
+            git merge --quiet --no-edit --no-ff -m "Merge main into $BRANCH" "$MAIN_SHA"
+          else
+            git checkout --quiet -B "$BRANCH" "$BASE_SHA"
+          fi
+          git apply --index --binary "$RUNNER_TEMP/atlas-out/change.patch"
+
+          # Re-check on what will actually be pushed: never .github/ (the App has no workflows permission).
+          if git diff --cached --name-only --no-renames | grep -E '^\.github/'; then
+            echo "The change touches .github/, which the GitHub App cannot push." > "$reason"
+            echo "::error::the patch touches .github/"
+            exit 1
+          fi
+
+          first_line="$(grep -m1 -v '^[[:space:]]*$' "$input_dir/intent.md" || true)"
+          first_line="${first_line//$'\r'/}"
+          if [ ${#first_line} -gt 72 ]; then first_line="${first_line:0:71}…"; fi
+          title="[$RUN_ID] ${first_line:-Mission $MISSION_ID}"
+          printf '%s\n\nMission: %s\nRun: %s\n' "$title" "$MISSION_ID" "$run_url" > "$RUNNER_TEMP/atlas-commit-msg.txt"
+          git commit --quiet --no-verify -F "$RUNNER_TEMP/atlas-commit-msg.txt"
+          # shellcheck disable=SC2016 # $GH_TOKEN is expanded by the credential helper, not here
+          git -c credential.helper= \
+            -c credential.helper='!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f' \
+            push --quiet origin "HEAD:refs/heads/$BRANCH"
+          head_sha="$(git rev-parse HEAD)"
+
+          pr_number="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state open --json number --jq '.[0].number // empty')"
+          if [ -z "$pr_number" ]; then
+            {
+              echo "Mission \`$MISSION_ID\` of run \`$RUN_ID\`, implemented by the ATLAS build agent ([build run]($run_url))."
+              echo
+              echo "## Intent"
+              echo
+              cat "$input_dir/intent.md"
+              echo
+              echo "## Mini-spec"
+              echo
+              cat "$input_dir/mini-spec.md"
+              echo
+              echo "---"
+              echo "Reviewed by the ATLAS reviewer (\`review.yml\`). Merges automatically once \`ci\` and \`atlas-review\` pass, unless it touches a CODEOWNERS path."
+            } > "$RUNNER_TEMP/atlas-pr-body.md"
+            pr_url="$(gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$BRANCH" \
+              --title "$title" --body-file "$RUNNER_TEMP/atlas-pr-body.md")"
+            pr_number="${pr_url##*/}"
+          else
+            {
+              echo "New attempt pushed by the ATLAS build agent ([build run]($run_url))."
+              if [ -f "$input_dir/feedback.md" ]; then
+                echo
+                echo "Feedback addressed:"
+                echo
+                sed 's/^/> /' "$input_dir/feedback.md"
+              fi
+            } > "$RUNNER_TEMP/atlas-pr-comment.md"
+            gh pr comment "$pr_number" --repo "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/atlas-pr-comment.md"
+          fi
+          if ! [[ "$pr_number" =~ ^[0-9]+$ ]]; then
+            echo "The branch was pushed but no open pull request was found for it." > "$reason"
+            echo "::error::no open PR for $BRANCH"
+            exit 1
+          fi
+          rm -f "$reason"
+          echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Report the result
+        id: result
+        if: always()
+        env:
+          AGENT_STATUS: ${{ needs.agent.outputs.agent_status }}
+          PR_OUTCOME: ${{ steps.pr.outcome }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          INPUT_TOKENS: ${{ needs.agent.outputs.input_tokens }}
+          OUTPUT_TOKENS: ${{ needs.agent.outputs.output_tokens }}
+        run: |
+          set -euo pipefail
+          reason_file="$RUNNER_TEMP/atlas-out/reason.txt"
+          if [ "$AGENT_STATUS" = "rate_limited" ]; then
+            status=rate_limited
+          elif [ "$PR_OUTCOME" = "success" ] && [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            status=succeeded
+          else
+            status=failed
+          fi
+          [[ "${INPUT_TOKENS:-0}" =~ ^[0-9]+$ ]] || INPUT_TOKENS=0
+          [[ "${OUTPUT_TOKENS:-0}" =~ ^[0-9]+$ ]] || OUTPUT_TOKENS=0
+          reason=""
+          if [ "$status" != "succeeded" ]; then
+            if [ -s "$reason_file" ]; then
+              reason="$(head -c 4000 "$reason_file")"
+            else
+              reason="The build stopped before the agent produced a change (see the agent job log)."
+            fi
+            PR_NUMBER=""
+            HEAD_SHA=""
+          fi
+          mkdir -p "$RUNNER_TEMP/atlas-result"
+          jq -n \
+            --arg run_id "$RUN_ID" --arg mission_id "$MISSION_ID" --arg status "$status" \
+            --arg pr_number "$PR_NUMBER" --arg head_sha "$HEAD_SHA" --arg branch "$BRANCH" \
+            --arg input_tokens "${INPUT_TOKENS:-0}" --arg output_tokens "${OUTPUT_TOKENS:-0}" \
+            --arg reason "$reason" \
+            '{run_id: $run_id, mission_id: $mission_id, status: $status,
+              pr_number: (if $pr_number == "" then null else ($pr_number | tonumber) end),
+              head_sha: (if $head_sha == "" then null else $head_sha end), branch: $branch,
+              input_tokens: ($input_tokens | tonumber), output_tokens: ($output_tokens | tonumber),
+              reason: (if $reason == "" then null else $reason end)}' \
+            > "$RUNNER_TEMP/atlas-result/result.json"
+          {
+            echo "status=$status"
+            echo "pr_number=$PR_NUMBER"
+            echo "head_sha=$HEAD_SHA"
+            echo "input_tokens=${INPUT_TOKENS:-0}"
+            echo "output_tokens=${OUTPUT_TOKENS:-0}"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## ATLAS build: \`$status\`"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Run / mission | \`$RUN_ID\` / \`$MISSION_ID\` |"
+            echo "| Branch | \`$BRANCH\` |"
+            echo "| PR | ${PR_NUMBER:+#$PR_NUMBER} |"
+            echo "| Tokens (input / output) | ${INPUT_TOKENS:-0} / ${OUTPUT_TOKENS:-0} |"
+            if [ -n "$reason" ]; then
+              echo
+              echo "**Why:**"
+              echo
+              echo '```'
+              echo "$reason"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/atlas-result/result.json"
+          # rate_limited is not a failure of this run: the caller retries later.
+          if [ "$status" = "failed" ]; then
+            echo "::error::build failed: ${reason%%$'\n'*}"
+            exit 1
+          fi
+
+      - name: Upload the result
+        if: always() && steps.result.outcome != 'skipped'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: atlas-build-result
+          path: ${{ runner.temp }}/atlas-result/result.json
+          retention-days: 7

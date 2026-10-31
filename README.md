@@ -70,6 +70,28 @@ pnpm build        # next build
 
 `.github/workflows/ci.yml` (job `ci`) runs on every PR and on `main`: forbidden-key guard, gitleaks secret scan, lint, typecheck, tests, architecture rules, build, Terraform fmt/validate, and a Docker smoke test (`/version`, `/`, `POST /api/events` answering 202 without GCP credentials). It has `contents: read` permissions only.
 
+## Factory build and review (ATLAS agents)
+
+Both workflows run Claude Code through `anthropics/claude-code-action` on Ronan's subscription (`CLAUDE_CODE_OAUTH_TOKEN`, never an API key). The GitHub App token (`ATLAS_APP_ID`, `ATLAS_APP_PRIVATE_KEY` in the `atlas-agents` environment, restricted to `main`) is minted only after the agent has finished.
+
+**`build.yml`** (`workflow_dispatch` on `main`; inputs `run_id`, `mission_id`, `intent`, `mini_spec`, optional `feedback`):
+
+1. validates `run_id` (`run_` + ULID) and `mission_id` (`msn_` + ULID), then writes the inputs to files (`.atlas-run/`), never into a shell command;
+2. checks out `atlas/{run_id}/{mission_id}` (created from `main`, or the existing branch merged with `main` when re-dispatched with `feedback`; a merge conflict ends the build as `failed`);
+3. runs the build agent (prompt `.github/atlas/build-prompt.md`): file tools and `pnpm lint|typecheck|test|arch|build` only;
+4. re-runs `pnpm lint && pnpm typecheck && pnpm test && pnpm arch && pnpm build`, refuses a change under `.github/`;
+5. job `agent` (steps 1-4) has no App secret and no environment; it hands a patch to job `publish` (environment `atlas-agents`), which re-checks the `.github/` rule, mints the App token, applies the patch in a fresh clone, pushes with the App token (so `ci` and `review` run), then opens the PR `[{run_id}] <intent>` or comments on the existing one;
+6. reports `status` (`succeeded` | `failed` | `rate_limited`), `pr_number`, `head_sha`, `input_tokens`, `output_tokens` as job outputs, in the job summary and in the `atlas-build-result` artifact (`result.json`). `rate_limited` (subscription usage limit) leaves the job green so the caller retries later; `failed` fails the job with the reason.
+
+**`review.yml`** (`pull_request_target` on PRs into `main`):
+
+- PRs from `atlas/{run_id}/{mission_id}` branches of this repo: the workflow and the reviewer's instructions (`.github/atlas/review-prompt.md`, `CLAUDE.md`) come from `main`; the PR head is checked out into `.atlas-pr/` as data (no credentials, instruction files and symlinks removed), never installed or run. The reviewer reads the diff with read-only tools and returns a verdict; the workflow posts it as a review, sets the commit status `atlas-review` (`success` on approval, `failure` on changes requested, `error` if the reviewer did not finish) and, on approval, has the App enable auto-merge (squash, pinned to the reviewed head). The PR then merges once `ci` and `atlas-review` pass, and `deploy.yml` ships it.
+- A PR touching a CODEOWNERS path (`infrastructure/`, `CLAUDE.md`, `.claude/`, `.github/`, `scripts/`, `.dependency-cruiser.cjs`, `tests/architecture/`) is never auto-merged: the reviewer's verdict is posted and Ronan is asked to review.
+- Any other PR from this repository gets `atlas-review = success` immediately; fork PRs get no status from this workflow.
+- GitHub does not let the App approve or request changes on a PR it opened itself; the verdict is then posted as a comment review. The required `atlas-review` status is what gates the merge.
+
+The `protect-main` ruleset requires both `ci` and `atlas-review` (commit statuses from GitHub Actions).
+
 ## Deployment
 
 `.github/workflows/deploy.yml` (job `deploy`) runs after `ci` succeeds on a push to `main` (a failed `ci` run never deploys), or by manual dispatch on `main`. A dispatch only redeploys the current `main` head, which the ruleset's required strict `ci` check gates; it does not rerun `ci` itself.
