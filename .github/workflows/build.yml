@@ -172,6 +172,9 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
 
+      - name: Install bubblewrap (Claude Code subprocess isolation)
+        run: sudo apt-get update -q && sudo apt-get install -y -q bubblewrap
+
       - name: Run the code agent (Claude Code, subscription)
         id: agent
         continue-on-error: true

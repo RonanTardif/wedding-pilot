@@ -171,6 +171,9 @@ jobs:
           delimiter="ATLAS_PROMPT_$(openssl rand -hex 16)"
           { echo "prompt<<$delimiter"; cat .github/atlas/review-prompt.md; echo "$delimiter"; } >> "$GITHUB_OUTPUT"
 
+      - name: Install bubblewrap (Claude Code subprocess isolation)
+        run: sudo apt-get update -q && sudo apt-get install -y -q bubblewrap
+
       - name: Run the reviewer (Claude Code, subscription, read-only)
         id: agent
         continue-on-error: true
