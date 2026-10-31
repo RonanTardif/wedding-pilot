@@ -1,0 +1,4 @@
+# Human review required on sensitive paths (AD: Factory acts only via PRs).
+/infrastructure/ @RonanTardif
+/CLAUDE.md @RonanTardif
+/.claude/ @RonanTardif
