@@ -30,6 +30,21 @@ describe("CI workflow guardrails", () => {
     }
   });
 
+  it("fails the build unless / is dynamic", () => {
+    const build = workflow.slice(workflow.indexOf("- name: Build"), workflow.indexOf("- name:", workflow.indexOf("- name: Build") + 1));
+    expect(build).toContain("set -o pipefail");
+    expect(build).toContain("pnpm build | tee build.log");
+    expect(build).toMatch(/grep -Eq 'ƒ \/[^\n]*build\.log/);
+  });
+
+  it("smoke-tests that / renders the bundled programme, not the fallback", () => {
+    const smoke = workflow.slice(workflow.indexOf("- name: Docker image smoke test"));
+    expect(smoke).toContain("jq -r '.coupleNames' src/event-programme/adapters/outbound/event.json");
+    expect(smoke).toContain('grep -qF "$couple_html" page.html');
+    expect(smoke).toContain('grep -qF "Programme du jour" page.html');
+    expect(smoke).toContain('grep -qF "momentanément indisponible" page.html');
+  });
+
   it("self-tests gitleaks on a planted fake secret right after the scan, failing if it is not detected", () => {
     const scan = workflow.indexOf("- name: Secret scan (gitleaks)");
     const selfTest = workflow.indexOf("- name: Secret scan self-test");
