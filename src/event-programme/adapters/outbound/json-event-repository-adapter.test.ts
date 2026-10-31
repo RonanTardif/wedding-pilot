@@ -56,6 +56,20 @@ describe("JsonEventRepositoryAdapter", () => {
     expect(event.steps[1]).not.toHaveProperty("description");
   });
 
+  it("keeps an optional kebab-case venueId as an opaque reference", async () => {
+    const event = await new JsonEventRepositoryAdapter({
+      ...validEvent,
+      steps: [{ ...validStep, venueId: "ferme-des-essais" }, { ...validStep, id: "b" }],
+    }).getEvent();
+    expect(event.steps[0]?.venueId).toBe("ferme-des-essais");
+    expect(event.steps[1]).not.toHaveProperty("venueId");
+  });
+
+  it("throws a typed error on a malformed venueId", async () => {
+    await expectInvalid({ ...validEvent, steps: [{ ...validStep, venueId: "Ferme des Essais" }] });
+    await expectInvalid({ ...validEvent, steps: [{ ...validStep, venueId: "" }] });
+  });
+
   it("throws a typed error when a step ends before it starts (broken fixture)", async () => {
     await expectInvalid(endBeforeStart);
   });

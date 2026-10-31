@@ -5,6 +5,8 @@ export interface ProgrammeStep {
   readonly start: Date;
   readonly end: Date;
   readonly description?: string;
+  /** Opaque reference to where the step happens (resolved to a name outside this context). */
+  readonly venueId?: string;
 }
 
 /** Steps in chronological order (by start, then end, then id), without mutating the input. */

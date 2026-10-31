@@ -8,52 +8,60 @@
       "title": "Accueil des invités",
       "start": "2027-06-19T14:30:00+02:00",
       "end": "2027-06-19T15:00:00+02:00",
-      "description": "Rafraîchissements à l'ombre des grands arbres."
+      "description": "Rafraîchissements à l'ombre des grands arbres.",
+      "venueId": "jardin-des-hetres-bleus"
     },
     {
       "id": "ceremonie",
       "title": "Cérémonie laïque",
       "start": "2027-06-19T15:00:00+02:00",
       "end": "2027-06-19T16:00:00+02:00",
-      "description": "Dans le jardin, merci d'arriver quelques minutes en avance."
+      "description": "Dans le jardin, merci d'arriver quelques minutes en avance.",
+      "venueId": "jardin-des-hetres-bleus"
     },
     {
       "id": "photos",
       "title": "Photos de groupe",
       "start": "2027-06-19T16:00:00+02:00",
-      "end": "2027-06-19T16:45:00+02:00"
+      "end": "2027-06-19T16:45:00+02:00",
+      "venueId": "jardin-des-hetres-bleus"
     },
     {
       "id": "vin-d-honneur",
       "title": "Vin d'honneur",
       "start": "2027-06-19T16:45:00+02:00",
       "end": "2027-06-19T19:00:00+02:00",
-      "description": "Jeux de plein air et musique douce."
+      "description": "Jeux de plein air et musique douce.",
+      "venueId": "orangerie-des-hetres-bleus"
     },
     {
       "id": "diner",
       "title": "Dîner",
       "start": "2027-06-19T19:30:00+02:00",
-      "end": "2027-06-19T22:30:00+02:00"
+      "end": "2027-06-19T22:30:00+02:00",
+      "venueId": "grange-de-la-combe-doree"
     },
     {
       "id": "ouverture-du-bal",
       "title": "Ouverture du bal",
       "start": "2027-06-19T22:30:00+02:00",
-      "end": "2027-06-19T23:00:00+02:00"
+      "end": "2027-06-19T23:00:00+02:00",
+      "venueId": "grange-de-la-combe-doree"
     },
     {
       "id": "soiree-dansante",
       "title": "Soirée dansante",
       "start": "2027-06-19T23:00:00+02:00",
-      "end": "2027-06-20T02:30:00+02:00"
+      "end": "2027-06-20T02:30:00+02:00",
+      "venueId": "grange-de-la-combe-doree"
     },
     {
       "id": "fin-de-soiree",
       "title": "Fin de la fête",
       "start": "2027-06-20T02:30:00+02:00",
       "end": "2027-06-20T03:00:00+02:00",
-      "description": "Dernier verre et départ des navettes."
+      "description": "Dernier verre et départ des navettes.",
+      "venueId": "grange-de-la-combe-doree"
     }
   ]
 }

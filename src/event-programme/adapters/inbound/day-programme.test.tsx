@@ -56,6 +56,37 @@ describe("DayProgramme", () => {
     lis.filter((_, i) => i !== index).forEach(expectUnmarked);
   });
 
+  describe("venue names", () => {
+    const withVenues: DayProgrammeModel = {
+      ...base,
+      steps: [
+        { id: "welcome", title: "Accueil", start: new Date("2027-05-08T13:00:00Z"), end: new Date("2027-05-08T13:30:00Z"), venueId: "jardin" },
+        { id: "dinner", title: "Dîner", start: new Date("2027-05-08T17:00:00Z"), end: new Date("2027-05-08T19:00:00Z"), venueId: "grange-disparue" },
+        { id: "free", title: "Temps libre", start: new Date("2027-05-08T19:00:00Z"), end: new Date("2027-05-08T20:00:00Z") },
+      ],
+    };
+    const names: ReadonlyMap<string, string> = new Map([["jardin", "Jardin & Co"]]);
+
+    it("shows the resolved venue name next to the step", () => {
+      const [welcome] = items(renderToStaticMarkup(<DayProgramme programme={withVenues} venueNameById={names} />));
+      expect(welcome).toContain('<span class="step-venue"> · Jardin &amp; Co</span>');
+    });
+
+    it("renders a step whose venue is missing, or without venue, with no venue name", () => {
+      const lis = items(renderToStaticMarkup(<DayProgramme programme={withVenues} venueNameById={names} />));
+      expect(lis).toHaveLength(3);
+      expect(lis[1]).toContain("Dîner");
+      expect(lis[1]).not.toContain("step-venue");
+      expect(lis[1]).not.toContain("grange-disparue");
+      expect(lis[2]).toContain("Temps libre");
+      expect(lis[2]).not.toContain("step-venue");
+    });
+
+    it("renders no venue names when no lookup is given", () => {
+      expect(render(withVenues)).not.toContain("step-venue");
+    });
+  });
+
   it("flags an end time on the next Paris calendar day with (+1 j)", () => {
     const html = render({
       ...base,

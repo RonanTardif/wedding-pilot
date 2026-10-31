@@ -24,6 +24,8 @@ Dockerfile                   Next.js standalone image for Cloud Run
 
 The fictional event and its day programme live in `src/event-programme/adapters/outbound/event.json` (validated by `JsonEventRepositoryAdapter`; times are ISO 8601 with offset, displayed in `Europe/Paris`).
 
+The fictional venues live in `src/venues/adapters/outbound/venues.json` (validated by `JsonVenueRepositoryAdapter`; kinds `ceremonie`, `cocktail`, `diner`, `hebergement`). Programme steps reference them by `venueId`; `src/app` resolves the names, and `tests/app/venue-references.test.ts` fails on a dangling reference.
+
 Conventions for contributors and agents: see [CLAUDE.md](./CLAUDE.md).
 
 ## Commands

@@ -1,0 +1,34 @@
+{
+  "venues": [
+    {
+      "id": "jardin-des-hetres-bleus",
+      "name": "Jardin du Domaine des Hêtres Bleus",
+      "kind": "ceremonie",
+      "address": "4 allée des Hêtres Bleus, 99120 Valombre-sur-Brume"
+    },
+    {
+      "id": "orangerie-des-hetres-bleus",
+      "name": "Orangerie des Hêtres Bleus",
+      "kind": "cocktail",
+      "address": "6 allée des Hêtres Bleus, 99120 Valombre-sur-Brume"
+    },
+    {
+      "id": "grange-de-la-combe-doree",
+      "name": "Grange de la Combe Dorée",
+      "kind": "diner",
+      "address": "Lieu-dit la Combe Dorée, 99120 Valombre-sur-Brume"
+    },
+    {
+      "id": "auberge-du-moulin-reveur",
+      "name": "Auberge du Moulin Rêveur",
+      "kind": "hebergement",
+      "address": "1 quai du Moulin Rêveur, 99121 Saint-Fictif-les-Saules"
+    },
+    {
+      "id": "gite-des-trois-saules",
+      "name": "Gîte des Trois Saules",
+      "kind": "hebergement",
+      "address": "18 route des Trois Saules, 99121 Saint-Fictif-les-Saules"
+    }
+  ]
+}
