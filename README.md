@@ -22,6 +22,8 @@ infrastructure/              Terraform: Artifact Registry repo + Cloud Run servi
 Dockerfile                   Next.js standalone image for Cloud Run
 ```
 
+The fictional event and its day programme live in `src/event-programme/adapters/outbound/event.json` (validated by `JsonEventRepositoryAdapter`; times are ISO 8601 with offset, displayed in `Europe/Paris`).
+
 Conventions for contributors and agents: see [CLAUDE.md](./CLAUDE.md).
 
 ## Commands

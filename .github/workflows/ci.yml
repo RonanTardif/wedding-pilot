@@ -85,7 +85,15 @@ jobs:
         run: pnpm arch
 
       - name: Build
-        run: pnpm build
+        # The home page highlights a step from the current time: `/` must stay dynamic (never prerendered).
+        run: |
+          set -o pipefail
+          pnpm build | tee build.log
+          if ! grep -Eq 'ƒ /([[:space:]]|$)' build.log; then
+            echo "::error::next build does not list / as dynamic (ƒ /)"
+            exit 1
+          fi
+          rm build.log
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
@@ -101,15 +109,25 @@ jobs:
 
       - name: Docker image smoke test (/version and /)
         run: |
+          # The page must render the bundled programme, not the fallback message (HTML-escaped couple names).
+          couple_html="$(jq -r '.coupleNames' src/event-programme/adapters/outbound/event.json | sed 's/&/\&amp;/g')"
           docker build -t wedding-page:ci .
           docker run -d -p 8080:8080 -e GIT_SHA="$GITHUB_SHA" wedding-page:ci
           for attempt in $(seq 1 30); do
             served="$(curl -fsS --max-time 5 localhost:8080/version | jq -r '.sha' || true)"
             if [ "$served" = "$GITHUB_SHA" ]; then
               echo "/version returns $served (attempt $attempt)"
-              status="$(curl -fsS --max-time 5 -o /dev/null -w '%{http_code}' localhost:8080/ || true)"
+              status="$(curl -sS --max-time 5 -o page.html -w '%{http_code}' localhost:8080/ || true)"
               if [ "$status" != "200" ]; then
                 echo "::error::/ returned HTTP '$status', expected 200"
+                exit 1
+              fi
+              if ! grep -qF "$couple_html" page.html || ! grep -qF "Programme du jour" page.html; then
+                echo "::error::/ does not render the bundled programme (couple names or 'Programme du jour' missing)"
+                exit 1
+              fi
+              if grep -qF "momentanément indisponible" page.html; then
+                echo "::error::/ renders the fallback error message"
                 exit 1
               fi
               exit 0

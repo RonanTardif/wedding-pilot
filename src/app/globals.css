@@ -1,0 +1,114 @@
+/* Mobile-first, plain CSS. */
+:root {
+  --fg: #1f1d1a;
+  --muted: #5e5a54;
+  --bg: #fbf9f6;
+  --line: #ddd6cc;
+  --accent: #7a3e2b;
+  --accent-bg: #f6e9e2;
+  color-scheme: light;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-size: 1rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+main {
+  max-width: 40rem;
+  margin: 0 auto;
+  padding: 1.5rem 16px 3rem;
+}
+
+h1 {
+  font-size: 1.75rem;
+  line-height: 1.2;
+  margin: 0 0 0.25rem;
+}
+
+h2 {
+  font-size: 1.25rem;
+  margin: 2rem 0 1rem;
+}
+
+.event-meta {
+  margin: 0;
+  color: var(--muted);
+}
+
+.timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border-left: 2px solid var(--line);
+}
+
+.step {
+  position: relative;
+  margin: 0 0 0.75rem;
+  padding: 0.5rem 0.75rem 0.5rem 1rem;
+  border-radius: 0 0.5rem 0.5rem 0;
+}
+
+.step-time {
+  margin: 0;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.9375rem;
+}
+
+.step-title {
+  margin: 0;
+  font-size: 1.0625rem;
+}
+
+.step-description {
+  margin: 0.25rem 0 0;
+  color: var(--muted);
+}
+
+.step--current {
+  background: var(--accent-bg);
+  margin-left: -2px;
+  border-left: 4px solid var(--accent);
+}
+
+/* Next step: outlined, no fill, so it reads differently from the running step. */
+.step--next {
+  margin-left: -2px;
+  border: 2px dashed var(--accent);
+  border-left-width: 4px;
+}
+
+.badge {
+  display: inline-block;
+  padding: 0 0.5rem;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  vertical-align: middle;
+}
+
+.step--next .badge {
+  background: transparent;
+  color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
