@@ -12,6 +12,9 @@ State: `gs://atlas-wedding-pilot-rt-tfstate/wedding-page/`.
   `…/wedding-pilot/wedding-page:<git SHA>`, env `GIT_SHA` derived from the image tag, 0 to 2
   instances, 1 vCPU / 512 MiB, public ingress.
 - `allUsers` -> `roles/run.invoker` on that service (the page is public).
+- BigQuery table `analytics.events` (usage events, partitioned by day on `occurred_at`,
+  `deletion_protection = true`). Only the table: the `analytics` dataset and its IAM
+  (`wedding-app` and `pilot-deployer` as data editors) come from `pilot-bootstrap`.
 
 ## What it never manages
 
