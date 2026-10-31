@@ -1,0 +1,142 @@
+name: deploy
+
+# Deploys main to Cloud Run once `ci` has passed on it (workflow_run). A manual dispatch
+# only redeploys the current main head, which the ruleset's required strict `ci` check gates.
+# A SHA that is no longer the main head (an older ci run finishing late) is skipped.
+# Under workflow_run this file always runs from main, so the OIDC token carries
+# ref=refs/heads/main and job_workflow_ref=RonanTardif/wedding-pilot/.github/workflows/deploy.yml@refs/heads/main,
+# which is exactly what the WIF provider accepts (pilot-bootstrap). Dispatching it on
+# any other ref is rejected at the auth step.
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+# One deploy at a time; never cancel a deploy in flight.
+concurrency:
+  group: deploy-wedding-page
+  cancel-in-progress: false
+
+env:
+  GCP_PROJECT: atlas-wedding-pilot-rt
+  GCP_REGION: europe-west9
+  WIF_PROVIDER: projects/554237653951/locations/global/workloadIdentityPools/github/providers/github-oidc
+  DEPLOYER_SA: pilot-deployer@atlas-wedding-pilot-rt.iam.gserviceaccount.com
+  TERRAFORM_VERSION: 1.17.1
+  # SHA that ci validated (workflow_run) or the dispatched ref's SHA.
+  DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+jobs:
+  deploy:
+    name: deploy
+    # Only a successful ci run on a push to main of this repo (not a fork PR whose branch is named main).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      # Not applied to a dispatch on another ref: its expected outcome is an auth failure.
+      - name: Skip unless DEPLOY_SHA is the current main head
+        id: guard
+        if: github.event_name == 'workflow_run' || github.ref == 'refs/heads/main'
+        run: |
+          head="$(git ls-remote https://github.com/${{ github.repository }} refs/heads/main | cut -f1)"
+          if ! [[ "$head" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::could not read the main head (got '$head')"
+            exit 1
+          fi
+          if [ "$head" != "$DEPLOY_SHA" ]; then
+            echo "::notice::$DEPLOY_SHA is not the main head ($head): skipping, the newer commit deploys itself"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout the validated commit
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.DEPLOY_SHA }}
+          persist-credentials: false
+
+      - name: Authenticate to Google Cloud (WIF, no key)
+        if: steps.guard.outputs.skip != 'true'
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOYER_SA }}
+          token_format: access_token
+
+      - name: Setup Terraform
+        if: steps.guard.outputs.skip != 'true'
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Compute image reference
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          if ! [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::unexpected SHA '$DEPLOY_SHA'"
+            exit 1
+          fi
+          echo "IMAGE=${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/wedding-pilot/wedding-page:${DEPLOY_SHA}" >> "$GITHUB_ENV"
+
+      - name: Terraform init
+        if: steps.guard.outputs.skip != 'true'
+        run: terraform -chdir=infrastructure init -input=false -lockfile=readonly
+
+      - name: Terraform apply (Artifact Registry repository first, the push needs it)
+        if: steps.guard.outputs.skip != 'true'
+        run: >-
+          terraform -chdir=infrastructure apply -input=false -auto-approve
+          -target=google_artifact_registry_repository.wedding_pilot
+          -var "image=${IMAGE}"
+
+      - name: Build and push the image
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+        run: |
+          echo "$ACCESS_TOKEN" | docker login -u oauth2accesstoken --password-stdin "https://${GCP_REGION}-docker.pkg.dev"
+          docker build --pull --tag "$IMAGE" .
+          docker push "$IMAGE"
+          docker logout "https://${GCP_REGION}-docker.pkg.dev"
+
+      - name: Terraform apply (Cloud Run service)
+        if: steps.guard.outputs.skip != 'true'
+        run: terraform -chdir=infrastructure apply -input=false -auto-approve -var "image=${IMAGE}"
+
+      - name: Verify /version serves the deployed SHA and the page is up
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          url="$(terraform -chdir=infrastructure output -raw service_url)"
+          echo "Service URL: $url"
+          for attempt in $(seq 1 20); do
+            served="$(curl -fsS --max-time 10 "$url/version" | jq -r '.sha' || true)"
+            if [ "$served" = "$DEPLOY_SHA" ]; then
+              echo "/version returns $served (attempt $attempt)"
+              status="$(curl -fsS --max-time 10 -o /dev/null -w '%{http_code}' "$url/" || true)"
+              if [ "$status" != "200" ]; then
+                echo "::error::page $url/ returned HTTP '$status', expected 200"
+                exit 1
+              fi
+              echo "page $url/ returns 200"
+              exit 0
+            fi
+            echo "attempt $attempt: /version returned '${served}', expected '$DEPLOY_SHA'"
+            sleep 10
+          done
+          echo "::error::/version did not return $DEPLOY_SHA"
+          exit 1
