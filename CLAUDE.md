@@ -38,10 +38,18 @@ Each bounded context lives in `src/<context>/` with exactly these layers:
 - Before pushing: `pnpm lint && pnpm typecheck && pnpm test && pnpm arch && pnpm build`.
 - Toolchain is pinned (Node 26, pnpm 12.16.1 via corepack, exact dependency versions). Use `pnpm install --frozen-lockfile` and commit `pnpm-lock.yaml` with any dependency change.
 
+## Deployment
+
+- Merged to `main` + `ci` green => `.github/workflows/deploy.yml` builds the image (tag = full git SHA), applies `infrastructure/` (Artifact Registry repo + public Cloud Run service `wedding-page`, europe-west9) and checks `GET /version`.
+- `GET /version` (`src/app/version/route.ts`) returns `{"sha": "<deployed SHA>"}` from `GIT_SHA`, or `"unknown"` locally. Keep its contract: the Factory relies on it to prove a merged SHA is live.
+- Rollback = a PR reverting the commit; CI redeploys it.
+- `infrastructure/` manages only the image repository and the Cloud Run service (+ its public invoker binding), later BigQuery tables. Never service accounts, project IAM, the `analytics` dataset or WIF: those live in the human `pilot-bootstrap` stack.
+
 ## Hard rules
 
 - **No real data.** Names, places, dates and guests are fictional. Never copy content from other repositories (including `app-mariage-v2`).
 - **Never add an Anthropic API key** (the `ANTHROPIC` + `_API_KEY` variable, in any spelling) anywhere: code, config, workflows, secrets, docs. CI (`scripts/guard-forbidden-key.sh`) fails if the name appears anywhere in the repo.
 - Never commit secrets; CI runs a gitleaks scan.
-- CI workflows keep `permissions: contents: read`. Do not add write permissions.
+- CI workflows keep `permissions: contents: read`. Do not add write permissions. The only exception is `deploy.yml`, which also has `id-token: write` (WIF to GCP) and nothing more.
+- Never deploy by hand and never add a GCP key or JSON credential: deployment happens only through `deploy.yml` after `ci` passes on `main`.
 - `infrastructure/**`, `CLAUDE.md`, `.claude/**`, `.github/**`, `scripts/**`, `.dependency-cruiser.cjs` and `tests/architecture/**` are owned by @RonanTardif (CODEOWNERS) and need his review.
