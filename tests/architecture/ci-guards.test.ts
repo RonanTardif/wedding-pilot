@@ -242,10 +242,17 @@ describe("Build workflow (Factory code agent)", () => {
   });
 
   it("re-runs every quality gate after the agent and before the App token exists", () => {
-    const gates = buildWorkflow.indexOf("for gate in lint typecheck test arch build; do");
-    expect(gates).toBeGreaterThan(buildWorkflow.indexOf("uses: anthropics/claude-code-action@"));
-    expect(gates).toBeLessThan(buildWorkflow.indexOf("permission-contents: write"));
+    // The gate runner is written to $RUNNER_TEMP before the agent runs, outside the agent-controlled workspace.
+    const runner = buildWorkflow.indexOf('cat > "$RUNNER_TEMP/atlas-gates.sh"');
+    expect(runner).toBeGreaterThan(-1);
+    expect(runner).toBeLessThan(buildWorkflow.indexOf("uses: anthropics/claude-code-action@"));
+    expect(buildWorkflow).toContain("for gate in lint typecheck test arch build; do");
     expect(buildWorkflow).toContain('if ! pnpm "$gate" > "$log" 2>&1; then');
+    // Final check after the (optional) repair run, before any App token.
+    const finalGates = buildWorkflow.indexOf("- name: Verify the quality gates after the repair");
+    expect(finalGates).toBeGreaterThan(buildWorkflow.indexOf("id: agent_fix"));
+    expect(finalGates).toBeLessThan(buildWorkflow.indexOf("permission-contents: write"));
+    expect(buildWorkflow).toContain("if: steps.gates.outcome == 'success'");
   });
 
   it("refuses changes under .github/ and pushes only atlas/ branches, never main", () => {
