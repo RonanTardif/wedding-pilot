@@ -63,6 +63,15 @@ describe("HomeContent composition", () => {
     expect(html).toContain("Les lieux sont momentanément indisponibles.");
   });
 
+  it.each([
+    { label: "everything available", props: { programme, venues } },
+    { label: "nothing available", props: { programme: null, venues: null } },
+  ])("renders the fictional-page footer exactly once ($label)", ({ props }) => {
+    const html = render(props);
+    expect(html.match(/Page fictive générée par ATLAS/g)).toHaveLength(1);
+    expect(html).toContain('<footer class="site-footer">Page fictive générée par ATLAS</footer>');
+  });
+
   it("keeps the venues section when the programme is unavailable", () => {
     const html = render({ programme: null, venues });
     expect(html).toContain("Le programme est momentanément indisponible.");

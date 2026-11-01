@@ -18,17 +18,20 @@ export function HomeContent({
   venues,
 }: Readonly<{ programme: DayProgrammeModel | null; venues: readonly ListedVenue[] | null }>) {
   return (
-    <main>
-      {programme ? (
-        <DayProgramme programme={programme} venueNameById={buildVenueNameById(venues)} />
-      ) : (
-        <>
-          <h1>Mariage</h1>
-          <p role="alert">Le programme est momentanément indisponible.</p>
-        </>
-      )}
-      <VenueList venues={venues} />
-      <UsageBeacon path="/" highlightedStepKind={programme ? (programme.highlight?.kind ?? "none") : undefined} />
-    </main>
+    <>
+      <main>
+        {programme ? (
+          <DayProgramme programme={programme} venueNameById={buildVenueNameById(venues)} />
+        ) : (
+          <>
+            <h1>Mariage</h1>
+            <p role="alert">Le programme est momentanément indisponible.</p>
+          </>
+        )}
+        <VenueList venues={venues} />
+        <UsageBeacon path="/" highlightedStepKind={programme ? (programme.highlight?.kind ?? "none") : undefined} />
+      </main>
+      <footer className="site-footer">Page fictive générée par ATLAS</footer>
+    </>
   );
 }
