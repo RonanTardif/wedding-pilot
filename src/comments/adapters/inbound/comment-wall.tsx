@@ -9,6 +9,15 @@ export function CommentWall({
   return (
     <section aria-labelledby="comments-title" id="comments">
       <h2 id="comments-title">Mur de commentaires</h2>
+      <p className="comment-intro">
+        Bienvenue sur le livre d&apos;or des mariés : laissez-leur un petit mot, il apparaîtra sur ce mur.
+      </p>
+      <ul className="comment-rules">
+        <li>Indiquez votre nom, puis votre message.</li>
+        <li>Votre message doit faire {MAX_MESSAGE_LENGTH} caractères au maximum.</li>
+        <li>Aucune inscription ni connexion n&apos;est nécessaire.</li>
+        <li>Cliquez sur « Publier » : votre message s&apos;affiche aussitôt.</li>
+      </ul>
       <form className="comment-form" method="post" action={action}>
         <label>
           Nom

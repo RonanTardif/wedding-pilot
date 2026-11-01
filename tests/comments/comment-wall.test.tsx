@@ -64,6 +64,13 @@ describe("CommentWall", () => {
     expect(html).toContain("Bravo");
   });
 
+  it("presents the guestbook with posting instructions", () => {
+    const html = renderToStaticMarkup(<CommentWall action="/x" comments={[]} />);
+    expect(html).toContain("livre d&#x27;or");
+    expect(html).toContain("10 caractères au maximum");
+    expect(html).toContain("Aucune inscription ni connexion");
+  });
+
   it("shows fallback messages", () => {
     expect(renderToStaticMarkup(<CommentWall action="/x" comments={[]} />)).toContain("Aucun commentaire");
     expect(renderToStaticMarkup(<CommentWall action="/x" comments={null} failed />)).toContain("indisponibles");
