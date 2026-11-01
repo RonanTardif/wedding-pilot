@@ -243,7 +243,7 @@ jobs:
         run: |
           # On failure, the reason carries the failing gate and the tail of its output (ANSI stripped) so the
           # next attempt's feedback names the actual error. The result step caps the reason at 4000 chars.
-          log="$RUNNER_TEMP/atlas-out/gate.log"
+          log="$RUNNER_TEMP/atlas-gate.log"
           for gate in lint typecheck test arch build; do
             if ! pnpm "$gate" > "$log" 2>&1; then
               cat "$log"
