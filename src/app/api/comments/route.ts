@@ -21,6 +21,7 @@ export async function POST(request: Request): Promise<Response> {
     // unreadable body: treated as an empty comment, rejected below
   }
   const result = await postComment(author, message);
-  const target = new URL(result.ok ? "/#comments" : "/?comment=invalid#comments", request.url);
-  return Response.redirect(target, 303);
+  // Relative Location: behind Cloud Run, request.url holds the internal host, not the public one.
+  const target = result.ok ? "/#comments" : "/?comment=invalid#comments";
+  return new Response(null, { status: 303, headers: { Location: target } });
 }
