@@ -4,8 +4,8 @@
   --muted: #5e5a54;
   --bg: #fbf9f6;
   --line: #ddd6cc;
-  --accent: #7a3e2b;
-  --accent-bg: #f6e9e2;
+  --accent: #2e6b3f;
+  --accent-bg: #e4f1e7;
   color-scheme: light;
 }
 
@@ -174,4 +174,55 @@ h2 {
 .venue-directions:hover,
 .venue-directions:focus-visible {
   background: var(--accent-bg);
+}
+
+.comment-form {
+  display: grid;
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+
+.comment-form label {
+  display: grid;
+  gap: 0.25rem;
+  font-weight: 600;
+}
+
+.comment-form input {
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  font: inherit;
+}
+
+.comment-form button {
+  justify-self: start;
+  padding: 0.5rem 1rem;
+  border: 0;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.comments {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.5rem;
+}
+
+.comment {
+  padding: 0.5rem 0.75rem;
+  border-left: 4px solid var(--accent);
+  background: var(--accent-bg);
+  border-radius: 0 0.5rem 0.5rem 0;
+}
+
+.comment-author {
+  margin-right: 0.5rem;
+  font-weight: 600;
 }

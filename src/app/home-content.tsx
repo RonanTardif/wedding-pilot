@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import type { DayProgramme as DayProgrammeModel } from "../event-programme/application/get-day-programme";
 import { DayProgramme } from "../event-programme/adapters/inbound/day-programme";
 import type { ListedVenue } from "../venues/application/list-venues";
@@ -16,7 +17,12 @@ export function buildVenueNameById(venues: readonly ListedVenue[] | null): Reado
 export function HomeContent({
   programme,
   venues,
-}: Readonly<{ programme: DayProgrammeModel | null; venues: readonly ListedVenue[] | null }>) {
+  comments = null,
+}: Readonly<{
+  programme: DayProgrammeModel | null;
+  venues: readonly ListedVenue[] | null;
+  comments?: ReactNode;
+}>) {
   return (
     <>
       <main>
@@ -29,6 +35,7 @@ export function HomeContent({
           </>
         )}
         <VenueList venues={venues} />
+        {comments}
         <UsageBeacon path="/" highlightedStepKind={programme ? (programme.highlight?.kind ?? "none") : undefined} />
       </main>
       <footer className="site-footer">Page fictive générée par ATLAS</footer>
