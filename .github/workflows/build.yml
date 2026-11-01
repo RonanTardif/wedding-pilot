@@ -241,10 +241,21 @@ jobs:
         if: steps.usage.outputs.agent_status == 'succeeded'
         continue-on-error: true
         run: |
-          if ! (pnpm lint && pnpm typecheck && pnpm test && pnpm arch && pnpm build); then
-            echo "The quality gates failed after the agent run (pnpm lint && pnpm typecheck && pnpm test && pnpm arch && pnpm build)." > "$RUNNER_TEMP/atlas-out/reason.txt"
-            exit 1
-          fi
+          # On failure, the reason carries the failing gate and the tail of its output (ANSI stripped) so the
+          # next attempt's feedback names the actual error. The result step caps the reason at 4000 chars.
+          log="$RUNNER_TEMP/atlas-out/gate.log"
+          for gate in lint typecheck test arch build; do
+            if ! pnpm "$gate" > "$log" 2>&1; then
+              cat "$log"
+              {
+                echo "The quality gate \`pnpm $gate\` failed after the agent run. Last lines of its output:"
+                echo
+                sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' "$log" | grep -v '^[[:space:]]*$' | tail -n 60 | tail -c 3600
+              } > "$RUNNER_TEMP/atlas-out/reason.txt"
+              exit 1
+            fi
+            cat "$log"
+          done
 
       - name: Collect the change
         id: changes
