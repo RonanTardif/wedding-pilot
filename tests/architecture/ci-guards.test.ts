@@ -242,9 +242,10 @@ describe("Build workflow (Factory code agent)", () => {
   });
 
   it("re-runs every quality gate after the agent and before the App token exists", () => {
-    const gates = buildWorkflow.indexOf("pnpm lint && pnpm typecheck && pnpm test && pnpm arch && pnpm build");
+    const gates = buildWorkflow.indexOf("for gate in lint typecheck test arch build; do");
     expect(gates).toBeGreaterThan(buildWorkflow.indexOf("uses: anthropics/claude-code-action@"));
     expect(gates).toBeLessThan(buildWorkflow.indexOf("permission-contents: write"));
+    expect(buildWorkflow).toContain('if ! pnpm "$gate" > "$log" 2>&1; then');
   });
 
   it("refuses changes under .github/ and pushes only atlas/ branches, never main", () => {
