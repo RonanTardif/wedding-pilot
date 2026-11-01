@@ -178,7 +178,7 @@ jobs:
       - name: Write the gate runner
         run: |
           # Outside the workspace: the agent cannot edit it. Runs the gates one by one; on the first failure it
-          # writes the failing gate and the tail of its output (ANSI stripped) to $RUNNER_TEMP/atlas-gate-failure.md.
+          # writes the failing gate and its full output (ANSI stripped) to $RUNNER_TEMP/atlas-gate-failure.md.
           cat > "$RUNNER_TEMP/atlas-gates.sh" <<'GATES'
           #!/usr/bin/env bash
           set -uo pipefail
@@ -188,10 +188,11 @@ jobs:
             if ! pnpm "$gate" > "$log" 2>&1; then
               cat "$log"
               {
-                echo "The quality gate \`pnpm $gate\` failed. Last lines of its output:"
+                echo "The quality gate \`pnpm $gate\` failed. Its full output:"
                 echo
                 echo '```'
-                sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' "$log" | grep -v '^[[:space:]]*$' | tail -n 60 | tail -c 3600
+                # Full output (ANSI stripped); only a safety cap far above any real gate log.
+                sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' "$log" | tail -c 30000
                 echo '```'
               } > "$RUNNER_TEMP/atlas-gate-failure.md"
               exit 1
@@ -213,6 +214,8 @@ jobs:
           github_token: ${{ github.token }}
           allowed_bots: ${{ vars.ATLAS_APP_SLUG }}[bot]
           prompt: ${{ steps.prepare.outputs.prompt }}
+          # Full transcript in the log: failures must be diagnosable (Ronan, 2026-11-01).
+          show_full_output: true
           claude_args: |
             --max-turns 150
             --allowedTools "Read,Glob,Grep,Edit,MultiEdit,Write,TodoWrite,Bash(pnpm lint),Bash(pnpm typecheck),Bash(pnpm test),Bash(pnpm test:*),Bash(pnpm arch),Bash(pnpm build)"
@@ -301,6 +304,8 @@ jobs:
           github_token: ${{ github.token }}
           allowed_bots: ${{ vars.ATLAS_APP_SLUG }}[bot]
           prompt: ${{ steps.prepare.outputs.prompt }}
+          # Full transcript in the log: failures must be diagnosable (Ronan, 2026-11-01).
+          show_full_output: true
           claude_args: |
             --max-turns 80
             --allowedTools "Read,Glob,Grep,Edit,MultiEdit,Write,TodoWrite,Bash(pnpm lint),Bash(pnpm typecheck),Bash(pnpm test),Bash(pnpm test:*),Bash(pnpm arch),Bash(pnpm build)"
@@ -569,7 +574,7 @@ jobs:
           reason=""
           if [ "$status" != "succeeded" ]; then
             if [ -s "$reason_file" ]; then
-              reason="$(head -c 4000 "$reason_file")"
+              reason="$(head -c 40000 "$reason_file")"
             else
               reason="The build stopped before the agent produced a change (see the agent job log)."
             fi
