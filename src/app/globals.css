@@ -36,6 +36,15 @@ main {
   padding: 1.5rem 16px 3rem;
 }
 
+.site-footer {
+  max-width: 40rem;
+  margin: 0 auto;
+  padding: 0 16px 2rem;
+  color: var(--muted);
+  font-size: 0.875rem;
+  text-align: center;
+}
+
 h1 {
   font-size: 1.75rem;
   line-height: 1.2;
