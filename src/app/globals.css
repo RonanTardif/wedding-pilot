@@ -1,15 +1,15 @@
 /* Mobile-first, plain CSS. */
 :root {
-  --fg: #f6eee4;
-  --muted: #cfc3b4;
-  --bg: #17120f;
-  --surface: #241b15;
-  --line: #4d3a2a;
-  --accent: #ff8a1f; /* Halloween orange */
-  --accent-bg: #3a2410;
-  --accent-contrast: #17120f;
-  --green: #8fd14f; /* Halloween green */
-  --green-bg: #1f2d14;
+  --fg: #fbf7ef; /* snow white */
+  --muted: #c9d6cc;
+  --bg: #0e2318; /* deep fir green */
+  --surface: #163225;
+  --line: #3f6b4f;
+  --accent: #ff6b6b; /* Christmas red */
+  --accent-bg: #4a1a1f;
+  --accent-contrast: #0e2318;
+  --green: #f2c94c; /* gold */
+  --green-bg: #1d3f2c; /* fir green tint */
   color-scheme: dark;
 }
 
@@ -26,6 +26,7 @@ html {
 
 body {
   margin: 0;
+  border-top: 4px solid var(--accent);
   background: var(--bg);
   color: var(--fg);
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
