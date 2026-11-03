@@ -10,10 +10,20 @@ name: review
 # Any other same-repo PR (human branch) gets atlas-review = success immediately: the agent review only
 # gates Factory PRs. Fork PRs get no status from this workflow.
 #
+# Story 6.2: the reviewer judges on evidence. The PR's own `ci` run (pull_request event, unprivileged, no
+# secret) records the gate outcomes, the Vitest and Playwright JSON reports and viewport screenshots in its
+# `atlas-proof` artifact. `review` waits for that run (bounded), downloads the artifact through the API,
+# validates it as data, computes the acceptance coverage (each criterion of the PR body's mini-spec proved by
+# a passing test named AC<n>, shared rules in .github/atlas/) and hands it to the reviewer under
+# `.atlas-proof/`. An approval without full proof becomes a change request. The evidence is self-reported by
+# PR code: changes to package.json scripts, test configs or reporters are flagged for scrutiny.
+#
 # Trust boundaries (pull_request_target runs with this repository's secrets):
-# - The workflow, the prompt and CLAUDE.md come from the base branch (main). The PR head is checked out
-#   into `.atlas-pr/` as data only, without credentials, stripped of instruction files and symlinks.
-# - No step runs PR code: no install, no build, no test (CI does that in `ci`, without secrets).
+# - No job of this workflow runs PR code: no install, no build, no test (`ci` does that, without secrets).
+# - The workflow, the prompt, CLAUDE.md and the evidence programs come from the base branch (main). The PR
+#   head is checked out into `.atlas-pr/` as data only, without credentials, stripped of instruction files
+#   and symlinks. The evidence arrives as data (fixed names, JSON objects and PNG files only, size-capped,
+#   symbolic links refused) and is summarised with jq and awk.
 # - The reviewer only has read tools; the verdict comes back as structured output and is posted by this
 #   workflow with the GitHub App token, minted after the agent has finished.
 on:
@@ -60,9 +70,11 @@ jobs:
       startsWith(github.event.pull_request.head.ref, 'atlas/') &&
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # Up to 30 min waiting for the PR's ci run, then the reviewer.
+    timeout-minutes: 60
     environment: atlas-agents
     permissions:
+      actions: read
       contents: read
       pull-requests: read
       statuses: write
@@ -171,6 +183,160 @@ jobs:
           delimiter="ATLAS_PROMPT_$(openssl rand -hex 16)"
           { echo "prompt<<$delimiter"; cat .github/atlas/review-prompt.md; echo "$delimiter"; } >> "$GITHUB_OUTPUT"
 
+      # Data only, never executed: the PR's ci run and its `atlas-proof` artifact, read with the job token.
+      - name: Wait for ci on the PR head and fetch its evidence (data only)
+        id: ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          raw="$RUNNER_TEMP/atlas-proof-raw"
+          problems="$RUNNER_TEMP/atlas-proof-problems.txt"
+          rm -rf "$raw" "$RUNNER_TEMP/atlas-proof.zip"
+          mkdir -p "$raw"
+          : > "$problems"
+          conclusion=not_found
+          run_id=""
+          deadline=$(( $(date +%s) + 30 * 60 ))
+          while :; do
+            runs="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?event=pull_request&head_sha=$HEAD_SHA&per_page=20" 2> /dev/null || echo '{}')"
+            run="$(jq -c --arg sha "$HEAD_SHA" --arg repo "$GITHUB_REPOSITORY" \
+              '[.workflow_runs[]? | select(.head_sha == $sha and .head_repository.full_name == $repo)] | sort_by(.id) | last // empty' <<< "$runs")"
+            if [ -n "$run" ] && [ "$(jq -r '.status' <<< "$run")" = "completed" ]; then
+              run_id="$(jq -r '.id' <<< "$run")"
+              conclusion="$(jq -r '.conclusion // "unknown"' <<< "$run")"
+              break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              conclusion=still_running_after_30_min
+              break
+            fi
+            sleep 20
+          done
+          [[ "$conclusion" =~ ^[a-z_0-9]+$ ]] || conclusion=unknown
+          echo "conclusion=$conclusion" >> "$GITHUB_OUTPUT"
+          echo "ci run on $HEAD_SHA: ${run_id:-none} ($conclusion)"
+          if ! [[ "$run_id" =~ ^[0-9]+$ ]]; then
+            echo "no completed ci run on the PR head" >> "$problems"
+            exit 0
+          fi
+          artifact="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts?name=atlas-proof" \
+            --jq '[.artifacts[]? | select(.name == "atlas-proof" and .expired == false)] | sort_by(.id) | last // empty | "\(.id) \(.size_in_bytes)"' || true)"
+          read -r artifact_id artifact_size <<< "${artifact:-x 0}"
+          if ! [[ "$artifact_id" =~ ^[0-9]+$ && "$artifact_size" =~ ^[0-9]+$ ]]; then
+            echo "the ci run uploaded no atlas-proof artifact" >> "$problems"
+            exit 0
+          fi
+          if [ "$artifact_size" -gt $((100 * 1024 * 1024)) ]; then
+            echo "the atlas-proof artifact is larger than 100 MB: refused" >> "$problems"
+            exit 0
+          fi
+          if ! gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip" > "$RUNNER_TEMP/atlas-proof.zip"; then
+            echo "the atlas-proof artifact could not be downloaded" >> "$problems"
+            exit 0
+          fi
+          # Fixed names only, checked before anything is extracted (no path traversal, no surprise file).
+          if ! names="$(unzip -Z1 "$RUNNER_TEMP/atlas-proof.zip")"; then
+            echo "the atlas-proof artifact is not a readable zip archive" >> "$problems"
+            exit 0
+          fi
+          if grep -Evq '^(gates\.json|vitest\.json|e2e\.json|shots/|shots/[A-Za-z0-9._-]+\.png)$' <<< "$names"; then
+            echo "the atlas-proof artifact holds unexpected paths: refused as a whole" >> "$problems"
+            exit 0
+          fi
+          if unzip -Z "$RUNNER_TEMP/atlas-proof.zip" | grep -q '^l'; then
+            echo "the atlas-proof artifact holds symbolic links: refused as a whole" >> "$problems"
+            exit 0
+          fi
+          unzip -q -o "$RUNNER_TEMP/atlas-proof.zip" -d "$raw"
+          echo "bundle=present" >> "$GITHUB_OUTPUT"
+
+      - name: Validate the evidence and summarise it for the reviewer
+        id: evidence
+        env:
+          CI_CONCLUSION: ${{ steps.ci.outputs.conclusion }}
+          BUNDLE: ${{ steps.ci.outputs.bundle }}
+        run: |
+          set -euo pipefail
+          raw="$RUNNER_TEMP/atlas-proof-raw"
+          dest=.atlas-proof
+          rm -rf "$dest"
+          mkdir -p "$dest/shots"
+          problems="$RUNNER_TEMP/atlas-proof-problems.txt"
+          touch "$problems"
+          max_json=$((5 * 1024 * 1024))
+          max_png=$((5 * 1024 * 1024))
+          max_total=$((40 * 1024 * 1024))
+          max_shots=12
+          total=0
+          shots=0
+          if [ "$BUNDLE" != "present" ] || [ ! -d "$raw" ]; then
+            [ -s "$problems" ] || echo "no evidence bundle from the ci run" >> "$problems"
+          elif [ -n "$(find "$raw" \( -type l -o \( ! -type f ! -type d \) \) -print -quit)" ]; then
+            echo "the evidence bundle contains symbolic links or special files: refused as a whole" >> "$problems"
+          else
+            # Only the expected names are kept: JSON reports and PNG screenshots, each size-capped.
+            while IFS= read -r -d '' file; do
+              rel="${file#"$raw"/}"
+              size="$(stat -c %s "$file")"
+              case "$rel" in
+                gates.json | vitest.json | e2e.json)
+                  if [ "$size" -gt "$max_json" ]; then
+                    echo "$rel is larger than 5 MB: dropped" >> "$problems"
+                  elif ! jq -e 'type == "object"' "$file" > /dev/null 2>&1; then
+                    echo "$rel is not a JSON object: dropped" >> "$problems"
+                  else
+                    cp "$file" "$dest/$rel"
+                    total=$((total + size))
+                  fi
+                  ;;
+                shots/*)
+                  name="${rel#shots/}"
+                  magic="$(head -c 8 "$file" | od -An -tx1 | tr -d ' \n')"
+                  if ! [[ "$name" =~ ^[A-Za-z0-9._-]+\.png$ ]]; then
+                    echo "screenshot with an unexpected name dropped" >> "$problems"
+                  elif [ "$magic" != "89504e470d0a1a0a" ]; then
+                    echo "shots/$name is not a PNG: dropped" >> "$problems"
+                  elif [ "$size" -gt "$max_png" ] || [ "$shots" -ge "$max_shots" ] || [ $((total + size)) -gt "$max_total" ]; then
+                    echo "shots/$name is over the size or count cap: dropped" >> "$problems"
+                  else
+                    cp "$file" "$dest/shots/$name"
+                    total=$((total + size))
+                    shots=$((shots + 1))
+                  fi
+                  ;;
+                *) echo "unexpected file dropped from the bundle" >> "$problems" ;;
+              esac
+            done < <(find "$raw" -type f -print0 | sort -z)
+          fi
+
+          # Acceptance criteria of the PR body's mini-spec, with the parser build.yml uses on the mini-spec itself.
+          awk -f .github/atlas/acceptance-criteria.awk .atlas-review/pr-body.md | jq -R . | jq -s . > "$RUNNER_TEMP/atlas-criteria.json"
+          jq -R . < .atlas-review/changed-files.txt | jq -s 'map(select(. != ""))' > "$RUNNER_TEMP/atlas-changed.json"
+
+          # The evidence is produced by the PR's own code: flag the changes that could bend it.
+          : > "$RUNNER_TEMP/atlas-scrutinize.txt"
+          if [ -f .atlas-pr/package.json ] && ! [ "$(jq -cS '.scripts // {}' package.json 2> /dev/null)" = "$(jq -cS '.scripts // {}' .atlas-pr/package.json 2> /dev/null)" ]; then
+            echo "package.json scripts changed" >> "$RUNNER_TEMP/atlas-scrutinize.txt"
+          fi
+          grep -Ei '^(vitest\.config\.|playwright\.config\.|p[n]pm-workspace\.yaml$|\.npmrc$|\.pnpmfile\.|package\.json$)|reporter|global-?(setup|teardown)' \
+            .atlas-review/changed-files.txt | sed 's/^/changed: /' >> "$RUNNER_TEMP/atlas-scrutinize.txt" || true
+          jq -R . < "$RUNNER_TEMP/atlas-scrutinize.txt" | jq -s . > "$RUNNER_TEMP/atlas-scrutinize.json"
+          for report in gates vitest e2e; do
+            if [ -f "$dest/$report.json" ]; then cp "$dest/$report.json" "$RUNNER_TEMP/atlas-$report.json"; else echo null > "$RUNNER_TEMP/atlas-$report.json"; fi
+          done
+          find "$dest/shots" -type f -name '*.png' | sort | jq -R . | jq -s . > "$RUNNER_TEMP/atlas-shots.json"
+          jq -R . < "$problems" | jq -s . > "$RUNNER_TEMP/atlas-problems.json"
+
+          jq -n --arg head_sha "$HEAD_SHA" --arg ci "${CI_CONCLUSION:-unknown}" \
+            --slurpfile criteria "$RUNNER_TEMP/atlas-criteria.json" --slurpfile gates "$RUNNER_TEMP/atlas-gates.json" \
+            --slurpfile unit "$RUNNER_TEMP/atlas-vitest.json" --slurpfile e2e "$RUNNER_TEMP/atlas-e2e.json" \
+            --slurpfile shots "$RUNNER_TEMP/atlas-shots.json" --slurpfile problems "$RUNNER_TEMP/atlas-problems.json" \
+            --slurpfile changed "$RUNNER_TEMP/atlas-changed.json" --slurpfile scrutinize "$RUNNER_TEMP/atlas-scrutinize.json" \
+            "$(cat .github/atlas/named-tests.jq .github/atlas/proof-summary.jq)" > "$dest/summary.json"
+          jq -r '"Evidence: proved=\(.proved); " + ((.reasons | join("; ")) | if . == "" then "nothing missing" else . end)
+            + (if (.scrutinize | length) > 0 then "; to scrutinize: " + (.scrutinize | join("; ")) else "" end)' "$dest/summary.json"
+
       - name: Install bubblewrap and socat (Claude Code sandbox dependencies)
         run: sudo apt-get update -q && sudo apt-get install -y -q bubblewrap socat
 
@@ -227,11 +393,32 @@ jobs:
             exit 1
           fi
 
+          # Story 6.2: the evidence decides in code too. An approval without full proof becomes a change request.
+          proof=.atlas-proof/summary.json
+          if ! jq -e 'type == "object" and (.reasons | type) == "array"' "$proof" > /dev/null 2>&1; then
+            jq -n '{proved: false, reasons: ["no evidence summary"]}' > "$RUNNER_TEMP/atlas-no-proof.json"
+            proof="$RUNNER_TEMP/atlas-no-proof.json"
+          fi
+          if [ "$verdict" = "approve" ] && ! jq -e '.proved == true' "$proof" > /dev/null; then
+            REVIEW_JSON="$(jq -c --slurpfile p "$proof" '.verdict = "request_changes"
+              | .summary += "\n\n**Not approved by the workflow:** the delivery is not proved (" + ($p[0].reasons | join("; ")) + ")."' <<< "$REVIEW_JSON")"
+            verdict=request_changes
+            echo "::warning::the reviewer approved without full proof: changed to request_changes"
+          fi
+          evidence_line="$(jq -r '
+            def n($x): if $x == null then "?" else ($x | tostring) end;
+            "**Evidence** (self-reported by the PR's ci run on this head): unit tests \(n(.unit.passed)) passed / \(n(.unit.failed)) failed, "
+            + "e2e \(n(.e2e.passed)) passed / \(n(.e2e.failed)) failed, "
+            + "acceptance criteria \(n(.acceptance.covered))/\(n(.acceptance.criteria)) covered, "
+            + "\((.screenshots // []) | length) screenshot(s)."
+            + (if (.reasons | length) > 0 then " Missing: " + (.reasons | join("; ")) + "." else "" end)
+            + (if ((.scrutinize // []) | length) > 0 then " To scrutinize: " + (.scrutinize | join("; ")) + "." else "" end)' "$proof")"
+
           # Review body: verdict, summary, then the comments (inline ones are also attached to their line).
           render_body() { # $1 = all | not-inline
-            jq -r --arg mode "$1" --arg run_url "$run_url" '
+            jq -r --arg mode "$1" --arg run_url "$run_url" --arg evidence "$evidence_line" '
               "**ATLAS review: " + (if .verdict == "approve" then "approve" else "changes requested" end)
-              + "** ([review run](" + $run_url + "))\n\n" + .summary
+              + "** ([review run](" + $run_url + "))\n\n" + .summary + "\n\n" + $evidence
               + ( [ .comments[] | select($mode == "all" or (.line == null)) ]
                   | if length == 0 then ""
                     else "\n\n### Comments\n\n" + (map("- `" + .path + (if .line then ":" + (.line | tostring) else "" end) + "`: " + .body) | join("\n"))

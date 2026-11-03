@@ -35,6 +35,14 @@ function runBlocks(content: string): string[] {
   return blocks;
 }
 
+/** The text of one job of a workflow, from its key to the next job (or the end of the file). */
+function jobOf(content: string, name: string): string {
+  const start = content.indexOf(`\n  ${name}:\n`);
+  if (start < 0) throw new Error(`no job ${name}`);
+  const next = content.slice(start + 1).search(/\n {2}[\w-]+:\n/);
+  return next < 0 ? content.slice(start) : content.slice(start, start + 1 + next);
+}
+
 /** Lines granting a write permission, outside the App token `permission-*` inputs. */
 function writeGrants(content: string): string[] {
   return content
@@ -100,9 +108,34 @@ describe("CI workflow guardrails", () => {
 describe("Deploy workflow guardrails", () => {
   it("grants exactly contents: read and id-token: write, nothing else", () => {
     expect(deployWorkflow).toMatch(/^permissions:\n {2}contents: read\n {2}id-token: write\n(?! )/m);
-    expect(deployWorkflow.match(/^\s*permissions:/gm)).toHaveLength(1);
+    // The only other permissions block is the smoke job's, which drops id-token.
+    expect(deployWorkflow.match(/^\s*permissions:/gm)).toHaveLength(2);
+    expect(jobOf(deployWorkflow, "smoke")).toMatch(/^ {4}permissions:\n {6}contents: read\n(?! {6})/m);
     const writes = deployWorkflow.match(/:\s*write\b/g) ?? [];
     expect(writes).toEqual([": write"]);
+  });
+
+  it("names each run after the deployed SHA, so the Factory can read its verdict (story 6.2)", () => {
+    expect(deployWorkflow).toContain("run-name: deploy ${{ github.event.workflow_run.head_sha || github.sha }}\n");
+  });
+
+  it("smoke-tests the public URL with the e2e suite after /version, without cloud credentials (story 6.2)", () => {
+    const deploy = jobOf(deployWorkflow, "deploy");
+    const smoke = jobOf(deployWorkflow, "smoke");
+    // The URL is published only once /version serves the deployed SHA and / answers 200.
+    const live = deploy.indexOf("- name: Verify /version serves the deployed SHA");
+    expect(live).toBeGreaterThan(-1);
+    expect(deploy.indexOf('echo "service_url=$url" >> "$GITHUB_OUTPUT"')).toBeGreaterThan(deploy.indexOf('if [ "$served" = "$DEPLOY_SHA" ]; then'));
+    expect(deploy).toContain("service_url: ${{ steps.live.outputs.service_url }}");
+    expect(smoke).toMatch(/^ {4}needs: deploy\n/m);
+    expect(smoke).toContain("if: needs.deploy.outputs.service_url != ''");
+    expect(smoke).toContain("E2E_BASE_URL: ${{ needs.deploy.outputs.service_url }}");
+    expect(smoke).toContain("pnpm exec playwright install --with-deps chromium");
+    // Only the read-only @smoke tests run against the public page.
+    expect(runBlocks(smoke).some((block) => /^\s*pnpm test:e2e --grep @smoke$/m.test(block))).toBe(true);
+    expect(runBlocks(smoke).some((block) => /pnpm test:e2e(?! --grep @smoke)/.test(block))).toBe(false);
+    expect(smoke).not.toMatch(/google-github-actions|secrets\.|id-token|environment:/);
+    expect(smoke).toContain("ref: ${{ env.DEPLOY_SHA }}");
   });
 
   it("deploys only after a successful ci run on main, without cancelling a deploy in flight", () => {
@@ -290,6 +323,65 @@ describe("Build workflow (Factory code agent)", () => {
   });
 });
 
+describe("Build workflow proof counts (story 6.2)", () => {
+  it("writes the Vitest and Playwright JSON reports and the proof counts from the gate runner", () => {
+    expect(buildWorkflow).toContain('pnpm test --reporter=default --reporter=json "--outputFile.json=$proof_raw/vitest.json"');
+    expect(buildWorkflow).toContain('--slurpfile e2e test-results/e2e.json');
+    expect(buildWorkflow).toContain('mv "$proof_raw/proof.json" "$RUNNER_TEMP/atlas-out/proof.json"');
+    // Written only after the last gate passed.
+    expect(buildWorkflow).toMatch(/\n {10}done\n {10}write_proof\n {10}GATES\n/);
+  });
+
+  it("proves each criterion from the test results with the reviewer's shared definitions, not with grep", () => {
+    expect(buildWorkflow).toContain("ac_count=\"$(awk -f .github/atlas/acceptance-criteria.awk .atlas-run/mini-spec.md | awk 'END { print NR }')\"");
+    expect(buildWorkflow).toContain('cp .github/atlas/named-tests.jq "$RUNNER_TEMP/atlas-lib/named-tests.jq"');
+    expect(buildWorkflow).toContain('if ! echo "$NAMED_TESTS_SHA  $lib" | /usr/bin/sha256sum --check --status; then');
+    expect(buildWorkflow).toContain("criterion_coverage($i; $tests)");
+    expect(buildWorkflow).toContain("ac_covered=\"$(jq '[.[] | select(.covered)] | length' <<< \"$result\")\"");
+    expect(buildWorkflow).not.toMatch(/grep -qE "\(test\|it\)/);
+    // Copied before the agent runs (the workspace is agent-writable).
+    expect(buildWorkflow.indexOf('cp .github/atlas/named-tests.jq')).toBeLessThan(buildWorkflow.indexOf("uses: anthropics/claude-code-action@"));
+  });
+
+  it("adds the re-validated counts (or null) to result.json in publish, counts only", () => {
+    const publishJob = buildWorkflow.slice(buildWorkflow.indexOf("\n  publish:\n"));
+    expect(publishJob).toContain('if [ "$status" = "succeeded" ] && [ -s "$proof_file" ]');
+    expect(publishJob).toContain("acceptance: {criteria: (.acceptance.criteria | count), covered: (.acceptance.covered | count)}");
+    expect(publishJob).toContain('--argjson proof "$proof"');
+    expect(publishJob).toContain("if length == 1 then .[0] else error");
+    // Never `proof: null`: the key is omitted, so older readers still parse the result.
+    expect(publishJob).toContain("+ (if $proof == null then {} else {proof: $proof} end)");
+  });
+
+  it("puts the mini-spec in the PR body, where the reviewer reads the acceptance criteria", () => {
+    expect(buildWorkflow).toContain('echo "## Mini-spec"');
+    expect(buildWorkflow).toContain('cat "$input_dir/mini-spec.md"');
+  });
+});
+
+describe("CI workflow delivery evidence (story 6.2)", () => {
+  it("records the gate outcomes, the JSON reports and screenshots in an atlas-proof artifact, even on failure", () => {
+    expect(workflow).toContain('pnpm test --reporter=default --reporter=json "--outputFile.json=$RUNNER_TEMP/atlas-proof/vitest.json"');
+    for (const id of ["install", "lint", "typecheck", "unit", "arch", "build", "e2e"]) {
+      expect(workflow).toContain(`\n        id: ${id}\n`);
+    }
+    const collect = workflow.slice(workflow.indexOf("- name: Collect the delivery evidence"));
+    expect(collect).toMatch(/^- name: Collect the delivery evidence\n {8}if: always\(\)\n/);
+    expect(collect).toContain('cp test-results/e2e.json "$out/e2e.json"');
+    // Viewport screenshots (one per browser test, CI only), at most 12.
+    expect(collect).toContain('[ "$shots" -lt 12 ] || break');
+    expect(collect).toContain("-name 'test-*.png'");
+    const upload = workflow.slice(workflow.indexOf("- name: Upload the delivery evidence"));
+    expect(upload).toMatch(/^- name: Upload the delivery evidence\n {8}if: always\(\)\n {8}uses: actions\/upload-artifact@[0-9a-f]{40} [^\n]*\n {8}with:\n {10}name: atlas-proof\n/);
+  });
+
+  it("stays without secrets: no secrets., no environment, only the read-only job token", () => {
+    expect(workflow).not.toMatch(/secrets\.|^\s+environment:/m);
+    expect(workflow).toMatch(/^on:\n {2}pull_request:\n {2}push:\n/m);
+    expect(workflow).not.toContain("pull_request_target");
+  });
+});
+
 describe("Review workflow (independent reviewer)", () => {
   it("runs on pull_request_target only, for PRs into main", () => {
     expect(reviewWorkflow).toMatch(/^on:\n {2}pull_request_target:\n {4}types: \[opened, synchronize, reopened\]\n {4}branches: \[main\]\n/m);
@@ -299,16 +391,66 @@ describe("Review workflow (independent reviewer)", () => {
   it("grants no default permission and only statuses: write per job", () => {
     expect(reviewWorkflow).toMatch(/^permissions: \{\}\n/m);
     expect(writeGrants(reviewWorkflow)).toEqual(["statuses: write", "statuses: write"]);
-    expect(reviewWorkflow).toMatch(/^ {4}permissions:\n {6}contents: read\n {6}pull-requests: read\n {6}statuses: write\n(?! {6})/m);
+    expect(reviewWorkflow).toMatch(/^ {4}permissions:\n {6}actions: read\n {6}contents: read\n {6}pull-requests: read\n {6}statuses: write\n(?! {6})/m);
   });
 
-  it("never runs PR code: no install, build, test or node step", () => {
-    for (const block of runBlocks(reviewWorkflow)) {
-      expect(block).not.toMatch(/\b(pnpm|npm|npx|node|yarn|bun|corepack|make|bash \.|sh \.)\b/);
-      expect(block).not.toMatch(/\.atlas-pr\/[^\s"']*\.(sh|js|ts|mjs|cjs)\b/);
+  it("never runs PR code: no install, build, test or node step in any job", () => {
+    const jobs = reviewWorkflow.slice(reviewWorkflow.indexOf("\njobs:\n"));
+    expect(jobs.match(/^ {2}[\w-]+:\n/gm)).toEqual(["  pass-through:\n", "  review:\n"]);
+    for (const job of [jobOf(reviewWorkflow, "pass-through"), jobOf(reviewWorkflow, "review")]) {
+      const blocks = runBlocks(job);
+      expect(blocks.length).toBeGreaterThan(0);
+      for (const block of blocks) {
+        expect(block).not.toMatch(/\b(pnpm|npm|npx|node|yarn|bun|corepack|make|bash \.|sh \.)\b/);
+        expect(block).not.toMatch(/\.atlas-pr\/[^\s"']*\.(sh|js|ts|mjs|cjs|jq)\b/);
+      }
+      expect(job).not.toContain("actions/setup-node@");
     }
-    expect(reviewWorkflow).not.toContain("actions/setup-node@");
     expect(reviewWorkflow).not.toMatch(/uses: \.\//);
+  });
+
+  it("sets atlas-review to pending first, then waits (bounded) for the PR's ci run (story 6.2)", () => {
+    const review = jobOf(reviewWorkflow, "review");
+    const firstStep = review.slice(review.indexOf("    steps:\n"));
+    expect(firstStep).toMatch(/^ {4}steps:\n {6}- name: Validate the PR and set atlas-review to pending\n/);
+    expect(review).not.toMatch(/^\s+needs:/m);
+    const wait = review.slice(review.indexOf("- name: Wait for ci on the PR head"), review.indexOf("- name: Validate the evidence"));
+    expect(wait).toContain("actions/workflows/ci.yml/runs?event=pull_request&head_sha=$HEAD_SHA");
+    expect(wait).toContain("deadline=$(( $(date +%s) + 30 * 60 ))");
+    expect(wait).toContain("GH_TOKEN: ${{ github.token }}");
+    // Fixed names and no symbolic link, checked before extraction.
+    expect(wait).toContain("grep -Evq '^(gates\\.json|vitest\\.json|e2e\\.json|shots/|shots/[A-Za-z0-9._-]+\\.png)$'");
+    expect(wait).toContain(`unzip -Z "$RUNNER_TEMP/atlas-proof.zip" | grep -q '^l'`);
+    expect(wait.indexOf("grep -Evq")).toBeLessThan(wait.indexOf('unzip -q -o "$RUNNER_TEMP/atlas-proof.zip"'));
+    expect(review).not.toContain("actions/download-artifact@");
+  });
+
+  it("hands the evidence to the reviewer as validated data only (story 6.2)", () => {
+    const review = jobOf(reviewWorkflow, "review");
+    const evidence = review.slice(review.indexOf("- name: Validate the evidence"), review.indexOf("- name: Install bubblewrap"));
+    // Symbolic links or special files refuse the bundle; only JSON objects and real PNGs, size-capped, are copied.
+    expect(evidence).toContain('find "$raw" \\( -type l -o \\( ! -type f ! -type d \\) \\) -print -quit');
+    expect(evidence).toContain("gates.json | vitest.json | e2e.json)");
+    expect(evidence).toContain('[ "$magic" != "89504e470d0a1a0a" ]');
+    expect(evidence).toContain("max_json=$((5 * 1024 * 1024))");
+    expect(evidence).toContain("max_png=$((5 * 1024 * 1024))");
+    expect(evidence).toContain('"$(cat .github/atlas/named-tests.jq .github/atlas/proof-summary.jq)" > "$dest/summary.json"');
+    expect(evidence).toContain("awk -f .github/atlas/acceptance-criteria.awk .atlas-review/pr-body.md");
+    expect(evidence).toContain("max_shots=12");
+    // Changes that could bend the self-reported evidence are flagged for the reviewer.
+    expect(evidence).toContain('echo "package.json scripts changed"');
+    // The summary is computed before the reviewer runs, which still only reads.
+    expect(review.indexOf("- name: Validate the evidence")).toBeLessThan(review.indexOf("uses: anthropics/claude-code-action@"));
+    expect(review).toContain('--allowedTools "Read,Glob,Grep"');
+    expect(review).toContain('--disallowedTools "Bash,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch"');
+  });
+
+  it("turns an approval without full proof into a change request, in code (story 6.2)", () => {
+    const post = reviewWorkflow.slice(reviewWorkflow.indexOf("- name: Post the verdict"));
+    const override = post.indexOf('if [ "$verdict" = "approve" ] && ! jq -e \'.proved == true\' "$proof" > /dev/null; then');
+    expect(override).toBeGreaterThan(-1);
+    expect(override).toBeLessThan(post.indexOf('if [ "$verdict" = "approve" ]; then event=APPROVE'));
+    expect(post).toContain('verdict=request_changes');
   });
 
   it("reads instructions from the base branch and the PR head only as stripped data", () => {

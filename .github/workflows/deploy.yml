@@ -7,6 +7,12 @@ name: deploy
 # ref=refs/heads/main and job_workflow_ref=RonanTardif/wedding-pilot/.github/workflows/deploy.yml@refs/heads/main,
 # which is exactly what the WIF provider accepts (pilot-bootstrap). Dispatching it on
 # any other ref is rejected at the auth step.
+#
+# Story 6.2: job `smoke` then replays the Playwright tests tagged @smoke against the public URL (synthetic traffic),
+# without any cloud credential. A red smoke fails this run; the Factory reads the run (named after the
+# deployed SHA) and fails the build mission.
+run-name: deploy ${{ github.event.workflow_run.head_sha || github.sha }}
+
 on:
   workflow_run:
     workflows: [ci]
@@ -43,6 +49,8 @@ jobs:
        github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    outputs:
+      service_url: ${{ steps.live.outputs.service_url }}
     steps:
       # Not applied to a dispatch on another ref: its expected outcome is an auth failure.
       - name: Skip unless DEPLOY_SHA is the current main head
@@ -119,6 +127,7 @@ jobs:
         run: terraform -chdir=infrastructure apply -input=false -auto-approve -var "image=${IMAGE}"
 
       - name: Verify /version serves the deployed SHA and the page is up
+        id: live
         if: steps.guard.outputs.skip != 'true'
         run: |
           url="$(terraform -chdir=infrastructure output -raw service_url)"
@@ -133,6 +142,7 @@ jobs:
                 exit 1
               fi
               echo "page $url/ returns 200"
+              echo "service_url=$url" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             echo "attempt $attempt: /version returned '${served}', expected '$DEPLOY_SHA'"
@@ -140,3 +150,62 @@ jobs:
           done
           echo "::error::/version did not return $DEPLOY_SHA"
           exit 1
+
+  smoke:
+    name: smoke
+    # After /version served the deployed SHA (the deploy job's last step). No cloud credential here: the e2e
+    # suite of the deployed commit runs against the public URL, with the `x-atlas-traffic: synthetic` header
+    # (playwright.config.ts); E2E_BASE_URL makes the config skip the local server.
+    needs: deploy
+    if: needs.deploy.outputs.service_url != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      COREPACK_VERSION: 0.36.0
+      E2E_BASE_URL: ${{ needs.deploy.outputs.service_url }}
+    steps:
+      - name: Checkout the deployed commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.DEPLOY_SHA }}
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Enable pnpm via corepack
+        run: |
+          npm install --global "corepack@${COREPACK_VERSION}"
+          corepack enable
+          pnpm --version
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      # Only the tests tagged @smoke: read-only checks (no form submission, no write) safe on the public page.
+      - name: Smoke test the public URL (Playwright @smoke tests, synthetic traffic)
+        run: |
+          if ! [[ "$E2E_BASE_URL" =~ ^https://[A-Za-z0-9.-]+$ ]]; then
+            echo "::error::unexpected service URL '$E2E_BASE_URL'"
+            exit 1
+          fi
+          echo "Running the @smoke e2e tests against $E2E_BASE_URL"
+          pnpm test:e2e --grep @smoke
+
+      - name: Upload the Playwright report
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: smoke-playwright-report
+          path: |
+            playwright-report/
+            test-results/
+          if-no-files-found: ignore
+          retention-days: 7

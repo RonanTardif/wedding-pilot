@@ -7,7 +7,9 @@ name: build
 # or updates the PR `[{run_id}] ...`.
 #
 # Result: `publish` job outputs and the `atlas-build-result` artifact (result.json):
-#   status = succeeded | failed | rate_limited, pr_number, head_sha, input_tokens, output_tokens, reason.
+#   status = succeeded | failed | rate_limited, pr_number, head_sha, input_tokens, output_tokens, reason,
+#   proof = {unit: {passed, failed}, e2e: {passed, failed}, acceptance: {criteria, covered}} | null (story 6.2:
+#   counts from the gate runner's last green run; null when the build did not succeed or the counts are unreadable).
 # `rate_limited` (subscription usage limit) keeps the run green so the caller retries later.
 #
 # Trust boundaries:
@@ -222,17 +224,28 @@ jobs:
           set -euo pipefail
           # Written before the agent runs; its SHA-256 is a step output, checked before every use (the agent's
           # free shell can write under $RUNNER_TEMP). The PR's own `ci` run stays the authoritative gate.
-          # The number of acceptance criteria is read here, from the mini-spec the workflow wrote.
-          ac_count="$(awk '/^## Acceptance criteria/{f=1;next} /^## /{f=0} f && /^[0-9]+\. /{c++} END{print c+0}' .atlas-run/mini-spec.md)"
+          # The number of acceptance criteria is read here, from the mini-spec the workflow wrote, with the parser
+          # the reviewer uses on the PR body. The named-test definition shared with the reviewer is copied out of
+          # the agent-writable workspace now, and its hash is checked by the runner before each use.
+          ac_count="$(awk -f .github/atlas/acceptance-criteria.awk .atlas-run/mini-spec.md | awk 'END { print NR }')"
+          mkdir -p "$RUNNER_TEMP/atlas-lib"
+          cp .github/atlas/named-tests.jq "$RUNNER_TEMP/atlas-lib/named-tests.jq"
+          named_tests_sha="$(sha256sum "$RUNNER_TEMP/atlas-lib/named-tests.jq" | cut -d' ' -f1)"
           cat > "$RUNNER_TEMP/atlas-gates.sh" <<'GATES'
           #!/usr/bin/env bash
           # Gates, in order: frozen install (node_modules matches the lockfile), lint, typecheck, test, arch,
-          # build, test:e2e, then the acceptance check (one test named AC<n> per criterion, in the tests this
-          # branch adds or changes). On the first failure it writes the failing gate and its full output
-          # (ANSI stripped) to $RUNNER_TEMP/atlas-gate-failure.md.
+          # build, test:e2e, then the acceptance check (each criterion proved by a passing test titled AC<n>, in a
+          # test file this branch adds or changes, read from the Vitest and Playwright JSON results with the
+          # reviewer's definition, .github/atlas/named-tests.jq). On the first failure it writes the failing gate and its full output
+          # (ANSI stripped) to $RUNNER_TEMP/atlas-gate-failure.md. When every gate passes it writes the proof
+          # counts (Vitest and Playwright JSON reports, criteria covered) to $RUNNER_TEMP/atlas-out/proof.json.
           set -uo pipefail
           log="$RUNNER_TEMP/atlas-gate.log"
-          rm -f "$RUNNER_TEMP/atlas-gate-failure.md"
+          proof_raw="$RUNNER_TEMP/atlas-proof-raw"
+          rm -f "$RUNNER_TEMP/atlas-gate-failure.md" "$RUNNER_TEMP/atlas-out/proof.json"
+          rm -rf "$proof_raw"
+          mkdir -p "$proof_raw"
+          ac_covered=0
           # Leftovers of the agent's own runs: reports linted as code, a server holding the e2e port.
           rm -rf test-results playwright-report
           pkill -f "next start" > /dev/null 2>&1 || true
@@ -242,28 +255,59 @@ jobs:
               echo "The mini-spec has no numbered acceptance criteria under '## Acceptance criteria'."
               return 1
             fi
-            local files=() f i missing=()
-            while IFS= read -r f; do
-              [ -f "$f" ] && files+=("$f")
-            done < <({ git -c core.hooksPath=/dev/null diff --name-only "$MAIN_SHA"; git ls-files --others --exclude-standard; } \
-                     | sort -u | grep -E '\.(test|spec|e2e)\.tsx?$' || true)
-            for i in $(seq 1 "$AC_COUNT"); do
-              if [ "${#files[@]}" -eq 0 ] || ! grep -qE "(test|it)(\.[a-z]+)?\([[:space:]]*[\"'\`]AC-?${i}([^0-9]|\$)" "${files[@]}"; then
-                missing+=("AC$i")
-              fi
-            done
-            if [ "${#missing[@]}" -gt 0 ]; then
-              echo "No test added or changed by this branch is named after: ${missing[*]}."
-              echo "Name each test after the criterion it proves, e.g. test(\"AC1: ...\") or it(\"AC2: ...\")."
-              echo "Test files added or changed: ${files[*]:-none}"
+            local lib="$RUNNER_TEMP/atlas-lib/named-tests.jq" report result missing
+            if ! echo "$NAMED_TESTS_SHA  $lib" | /usr/bin/sha256sum --check --status; then
+              echo "The named-test definition was modified during the run."
               return 1
             fi
-            echo "Each of the $AC_COUNT acceptance criteria has a named test."
+            for report in "$proof_raw/vitest.json" test-results/e2e.json; do
+              if [ ! -f "$report" ]; then
+                echo "The test report $report is missing: the acceptance check reads the test results."
+                return 1
+              fi
+            done
+            { git -c core.hooksPath=/dev/null diff --name-only "$MAIN_SHA"; git ls-files --others --exclude-standard; } \
+              | sort -u | jq -R . | jq -s 'map(select(. != ""))' > "$proof_raw/changed.json"
+            if ! result="$(jq -n --argjson count "$AC_COUNT" --slurpfile unit "$proof_raw/vitest.json" \
+                --slurpfile e2e test-results/e2e.json --slurpfile changed "$proof_raw/changed.json" "$(cat "$lib"; echo '
+                  [ named_tests($unit[0]; $e2e[0])[] | select(in_files($changed[0])) ] as $tests
+                  | [ range(1; $count + 1) as $i | criterion_coverage($i; $tests) ]')")"; then
+              echo "The test reports could not be read."
+              return 1
+            fi
+            ac_covered="$(jq '[.[] | select(.covered)] | length' <<< "$result")"
+            missing="$(jq -r '[ .[] | select(.covered | not)
+              | if (.tests | length) == 0 then "\(.id) (no test named after it)"
+                else "\(.id) (named test not passed: " + ([ .tests[] | select(.proves | not) | "\(.title) [\(.status)]" ] | join(", ")) + ")" end ]
+              | join("; ")' <<< "$result")"
+            if [ -n "$missing" ]; then
+              echo "Not proved by a passing test named after it, in a test file this branch adds or changes: $missing."
+              echo "Name each test (not its describe block) after the criterion it proves, e.g. test(\"AC1: ...\") or"
+              echo "it(\"AC2: ...\"), and make it pass; skipped, fixme and todo tests never count."
+              return 1
+            fi
+            echo "Each of the $AC_COUNT acceptance criteria is proved: $(jq -r 'map(.id + " by " + ([ .tests[].title ] | join(" | "))) | join("; ")' <<< "$result")"
+          }
+          # Counts only (never test names or output); a report that cannot be read gives no proof, not a failure.
+          write_proof() {
+            if ! jq -n --slurpfile unit "$proof_raw/vitest.json" --slurpfile e2e test-results/e2e.json \
+                --argjson criteria "$AC_COUNT" --argjson covered "$ac_covered" '
+                  def count: if type == "number" and . >= 0 and . == floor then . else error("not a count") end;
+                  {unit: {passed: ($unit[0].numPassedTests | count), failed: ($unit[0].numFailedTests | count)},
+                   e2e: {passed: ($e2e[0].stats.expected | count),
+                         failed: (($e2e[0].stats.unexpected | count) + ($e2e[0].stats.flaky // 0 | count))},
+                   acceptance: {criteria: $criteria, covered: $covered}}' > "$proof_raw/proof.json"; then
+              echo "::warning::the test reports could not be read: no proof counts for this build"
+              return 0
+            fi
+            mv "$proof_raw/proof.json" "$RUNNER_TEMP/atlas-out/proof.json"
+            echo "Proof: $(cat "$RUNNER_TEMP/atlas-out/proof.json" | tr -d '\n ')"
           }
           for gate in install lint typecheck test arch build test:e2e acceptance; do
             case "$gate" in
               install) label="pnpm install --frozen-lockfile --offline"; run() { pnpm install --frozen-lockfile --offline; } ;;
               acceptance) label="acceptance check"; run() { check_acceptance; } ;;
+              test) label="pnpm test"; run() { pnpm test --reporter=default --reporter=json "--outputFile.json=$proof_raw/vitest.json"; } ;;
               *) label="pnpm $gate"; run() { pnpm "$gate"; } ;;
             esac
             if ! run > "$log" 2>&1; then
@@ -280,8 +324,9 @@ jobs:
             fi
             cat "$log"
           done
+          write_proof
           GATES
-          sed -i -e "s/^set -uo pipefail$/set -uo pipefail\nAC_COUNT=${ac_count}\nMAIN_SHA=${MAIN_SHA}/" "$RUNNER_TEMP/atlas-gates.sh"
+          sed -i -e "s/^set -uo pipefail$/set -uo pipefail\nAC_COUNT=${ac_count}\nMAIN_SHA=${MAIN_SHA}\nNAMED_TESTS_SHA=${named_tests_sha}/" "$RUNNER_TEMP/atlas-gates.sh"
           chmod +x "$RUNNER_TEMP/atlas-gates.sh"
           echo "sha=$(sha256sum "$RUNNER_TEMP/atlas-gates.sh" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
           echo "Gate runner written ($ac_count acceptance criteria)."
@@ -700,6 +745,20 @@ jobs:
           fi
           [[ "${INPUT_TOKENS:-0}" =~ ^[0-9]+$ ]] || INPUT_TOKENS=0
           [[ "${OUTPUT_TOKENS:-0}" =~ ^[0-9]+$ ]] || OUTPUT_TOKENS=0
+          # Proof counts (story 6.2), re-validated here: six non-negative integers; omitted from result.json otherwise.
+          proof=null
+          proof_file="$RUNNER_TEMP/atlas-out/proof.json"
+          if [ "$status" = "succeeded" ] && [ -s "$proof_file" ] && [ "$(wc -c < "$proof_file")" -lt 4096 ]; then
+            proof="$(jq -cs '
+              def count: if type == "number" and . >= 0 and . == floor and . < 1000000 then . else error("not a count") end;
+              if length == 1 then .[0] else error("exactly one JSON value expected") end
+              | {unit: {passed: (.unit.passed | count), failed: (.unit.failed | count)},
+               e2e: {passed: (.e2e.passed | count), failed: (.e2e.failed | count)},
+               acceptance: {criteria: (.acceptance.criteria | count), covered: (.acceptance.covered | count)}}
+              | if .acceptance.covered > .acceptance.criteria then error("more covered than criteria") else . end
+              ' "$proof_file" 2> /dev/null || true)"
+            [ -n "$proof" ] || proof=null
+          fi
           reason=""
           if [ "$status" != "succeeded" ]; then
             if [ -s "$reason_file" ]; then
@@ -715,12 +774,13 @@ jobs:
             --arg run_id "$RUN_ID" --arg mission_id "$MISSION_ID" --arg status "$status" \
             --arg pr_number "$PR_NUMBER" --arg head_sha "$HEAD_SHA" --arg branch "$BRANCH" \
             --arg input_tokens "${INPUT_TOKENS:-0}" --arg output_tokens "${OUTPUT_TOKENS:-0}" \
-            --arg reason "$reason" \
+            --arg reason "$reason" --argjson proof "$proof" \
             '{run_id: $run_id, mission_id: $mission_id, status: $status,
               pr_number: (if $pr_number == "" then null else ($pr_number | tonumber) end),
               head_sha: (if $head_sha == "" then null else $head_sha end), branch: $branch,
               input_tokens: ($input_tokens | tonumber), output_tokens: ($output_tokens | tonumber),
-              reason: (if $reason == "" then null else $reason end)}' \
+              reason: (if $reason == "" then null else $reason end)}
+              + (if $proof == null then {} else {proof: $proof} end)' \
             > "$RUNNER_TEMP/atlas-result/result.json"
           {
             echo "status=$status"
@@ -738,6 +798,9 @@ jobs:
             echo "| Branch | \`$BRANCH\` |"
             echo "| PR | ${PR_NUMBER:+#$PR_NUMBER} |"
             echo "| Tokens (input / output) | ${INPUT_TOKENS:-0} / ${OUTPUT_TOKENS:-0} |"
+            if [ "$proof" != "null" ]; then
+              jq -r '"| Proof | unit \(.unit.passed) passed / \(.unit.failed) failed, e2e \(.e2e.passed) passed / \(.e2e.failed) failed, criteria \(.acceptance.covered)/\(.acceptance.criteria) covered |"' <<< "$proof"
+            fi
             if [ -n "$reason" ]; then
               echo
               echo "**Why:**"
