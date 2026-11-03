@@ -1,7 +1,8 @@
 import { expect, test } from "@playwright/test";
 
 test.describe("home page", () => {
-  test("renders the header, the programme with its next step and the venues", async ({ page }, testInfo) => {
+  // @smoke: also replayed against the public URL after each deployment; read-only (no form, no write).
+  test("renders the header, the programme with its next step and the venues", { tag: "@smoke" }, async ({ page }, testInfo) => {
     const response = await page.goto("/");
     expect(response?.status()).toBe(200);
 
@@ -24,7 +25,7 @@ test.describe("home page", () => {
     await page.screenshot({ path: `test-results/playwright/shots/home-${testInfo.project.name}.png`, fullPage: true });
   });
 
-  test("/version answers JSON with a sha", async ({ request }) => {
+  test("/version answers JSON with a sha", { tag: "@smoke" }, async ({ request }) => {
     const response = await request.get("/version");
     expect(response.status()).toBe(200);
     expect(response.headers()["content-type"]).toContain("application/json");

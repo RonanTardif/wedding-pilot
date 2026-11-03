@@ -21,7 +21,8 @@ export default defineConfig({
     // Test traffic is flagged so usage analytics can drop it.
     extraHTTPHeaders: { "x-atlas-traffic": "synthetic" },
     trace: "retain-on-failure",
-    screenshot: "only-on-failure",
+    // In CI, a viewport-sized screenshot at the end of every browser test: the reviewer's evidence (story 6.2).
+    screenshot: process.env.CI ? "on" : "only-on-failure",
   },
   projects: [
     { name: "mobile", use: { ...devices["Desktop Chrome"], viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true } },

@@ -131,7 +131,9 @@ describe("Deploy workflow guardrails", () => {
     expect(smoke).toContain("if: needs.deploy.outputs.service_url != ''");
     expect(smoke).toContain("E2E_BASE_URL: ${{ needs.deploy.outputs.service_url }}");
     expect(smoke).toContain("pnpm exec playwright install --with-deps chromium");
-    expect(runBlocks(smoke).some((block) => /\n\s*pnpm test:e2e\s*$/.test(block) || /^pnpm test:e2e$/m.test(block))).toBe(true);
+    // Only the read-only @smoke tests run against the public page.
+    expect(runBlocks(smoke).some((block) => /^\s*pnpm test:e2e --grep @smoke$/m.test(block))).toBe(true);
+    expect(runBlocks(smoke).some((block) => /pnpm test:e2e(?! --grep @smoke)/.test(block))).toBe(false);
     expect(smoke).not.toMatch(/google-github-actions|secrets\.|id-token|environment:/);
     expect(smoke).toContain("ref: ${{ env.DEPLOY_SHA }}");
   });
@@ -330,12 +332,25 @@ describe("Build workflow proof counts (story 6.2)", () => {
     expect(buildWorkflow).toMatch(/\n {10}done\n {10}write_proof\n {10}GATES\n/);
   });
 
+  it("proves each criterion from the test results with the reviewer's shared definitions, not with grep", () => {
+    expect(buildWorkflow).toContain("ac_count=\"$(awk -f .github/atlas/acceptance-criteria.awk .atlas-run/mini-spec.md | awk 'END { print NR }')\"");
+    expect(buildWorkflow).toContain('cp .github/atlas/named-tests.jq "$RUNNER_TEMP/atlas-lib/named-tests.jq"');
+    expect(buildWorkflow).toContain('if ! echo "$NAMED_TESTS_SHA  $lib" | /usr/bin/sha256sum --check --status; then');
+    expect(buildWorkflow).toContain("criterion_coverage($i; $tests)");
+    expect(buildWorkflow).toContain("ac_covered=\"$(jq '[.[] | select(.covered)] | length' <<< \"$result\")\"");
+    expect(buildWorkflow).not.toMatch(/grep -qE "\(test\|it\)/);
+    // Copied before the agent runs (the workspace is agent-writable).
+    expect(buildWorkflow.indexOf('cp .github/atlas/named-tests.jq')).toBeLessThan(buildWorkflow.indexOf("uses: anthropics/claude-code-action@"));
+  });
+
   it("adds the re-validated counts (or null) to result.json in publish, counts only", () => {
     const publishJob = buildWorkflow.slice(buildWorkflow.indexOf("\n  publish:\n"));
     expect(publishJob).toContain('if [ "$status" = "succeeded" ] && [ -s "$proof_file" ]');
     expect(publishJob).toContain("acceptance: {criteria: (.acceptance.criteria | count), covered: (.acceptance.covered | count)}");
     expect(publishJob).toContain('--argjson proof "$proof"');
-    expect(publishJob).toContain("proof: $proof}");
+    expect(publishJob).toContain("if length == 1 then .[0] else error");
+    // Never `proof: null`: the key is omitted, so older readers still parse the result.
+    expect(publishJob).toContain("+ (if $proof == null then {} else {proof: $proof} end)");
   });
 
   it("puts the mini-spec in the PR body, where the reviewer reads the acceptance criteria", () => {
@@ -344,48 +359,26 @@ describe("Build workflow proof counts (story 6.2)", () => {
   });
 });
 
-describe("Review workflow: verify job (story 6.2)", () => {
-  const verify = jobOf(reviewWorkflow, "verify");
-
-  it("runs for ATLAS branches of this repository only, with a read-only token, no secret and no environment", () => {
-    expect(verify).toMatch(
-      /if: >-\n\s+startsWith\(github\.event\.pull_request\.head\.ref, 'atlas\/'\) &&\n\s+github\.event\.pull_request\.head\.repo\.full_name == github\.repository\n/,
-    );
-    expect(verify).toMatch(/^ {4}permissions:\n {6}contents: read\n(?! {6})/m);
-    expect(verify).not.toMatch(/secrets\.|^\s+environment:|github\.token|claude-code-action|create-github-app-token/m);
-    expect(verify).not.toMatch(/^\s+needs:/m);
+describe("CI workflow delivery evidence (story 6.2)", () => {
+  it("records the gate outcomes, the JSON reports and screenshots in an atlas-proof artifact, even on failure", () => {
+    expect(workflow).toContain('pnpm test --reporter=default --reporter=json "--outputFile.json=$RUNNER_TEMP/atlas-proof/vitest.json"');
+    for (const id of ["install", "lint", "typecheck", "unit", "arch", "build", "e2e"]) {
+      expect(workflow).toContain(`\n        id: ${id}\n`);
+    }
+    const collect = workflow.slice(workflow.indexOf("- name: Collect the delivery evidence"));
+    expect(collect).toMatch(/^- name: Collect the delivery evidence\n {8}if: always\(\)\n/);
+    expect(collect).toContain('cp test-results/e2e.json "$out/e2e.json"');
+    // Viewport screenshots (one per browser test, CI only), at most 12.
+    expect(collect).toContain('[ "$shots" -lt 12 ] || break');
+    expect(collect).toContain("-name 'test-*.png'");
+    const upload = workflow.slice(workflow.indexOf("- name: Upload the delivery evidence"));
+    expect(upload).toMatch(/^- name: Upload the delivery evidence\n {8}if: always\(\)\n {8}uses: actions\/upload-artifact@[0-9a-f]{40} [^\n]*\n {8}with:\n {10}name: atlas-proof\n/);
   });
 
-  it("blocks egress first, with the build allowlist minus every Anthropic host", () => {
-    const firstStep = verify.slice(verify.indexOf("    steps:\n"));
-    expect(firstStep).toMatch(/^ {4}steps:\n(?: {6}#[^\n]*\n)* {6}- name: [^\n]+\n {8}uses: step-security\/harden-runner@[0-9a-f]{40} [^\n]*\n {8}with:\n {10}egress-policy: block\n/);
-    const allowed = (/allowed-endpoints: >\n((?: {12}\S+\n)+)/.exec(verify)?.[1] ?? "").split("\n").map((l) => l.trim()).filter(Boolean);
-    expect(allowed).toContain("registry.npmjs.org:443");
-    expect(allowed).toContain("cdn.playwright.dev:443");
-    expect(allowed.filter((host) => /anthropic|claude/.test(host))).toEqual([]);
-    const buildAllowed = (/allowed-endpoints: >\n((?: {12}\S+\n)+)/.exec(buildWorkflow)?.[1] ?? "").split("\n").map((l) => l.trim()).filter(Boolean);
-    expect(allowed.sort()).toEqual(buildAllowed.filter((host) => !/anthropic|claude/.test(host)).sort());
-  });
-
-  it("checks out the PR head without credentials and runs no PR script before sudo is gone", () => {
-    expect(verify).toMatch(/ref: \$\{\{ github\.event\.pull_request\.head\.sha \}\}\n\s+persist-credentials: false\n/);
-    const install = verify.indexOf("pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile");
-    const drop = verify.indexOf("- name: Drop root and containers before the PR code runs");
-    const gates = verify.indexOf("- name: Run the gates and collect the evidence");
-    expect(install).toBeGreaterThan(-1);
-    expect(drop).toBeGreaterThan(install);
-    expect(gates).toBeGreaterThan(drop);
-    expect(verify).toContain('if sudo -n true > /dev/null 2>&1; then');
-    expect(verify.slice(gates)).not.toMatch(/\bsudo\b/);
-  });
-
-  it("runs every gate including e2e and uploads the evidence bundle even when a gate fails", () => {
-    expect(verify).toContain("for gate in install lint typecheck test arch build test:e2e; do");
-    expect(verify).toContain('"--outputFile.json=$out/vitest.json"');
-    expect(verify).toContain('cp test-results/e2e.json "$out/e2e.json"');
-    const upload = verify.slice(verify.indexOf("- name: Upload the evidence bundle"));
-    expect(upload).toMatch(/^- name: Upload the evidence bundle\n {8}if: always\(\)\n {8}uses: actions\/upload-artifact@[0-9a-f]{40} [^\n]*\n {8}with:\n {10}name: atlas-proof\n/);
-    expect(verify).toContain("if: steps.gates.outputs.failed != '0'");
+  it("stays without secrets: no secrets., no environment, only the read-only job token", () => {
+    expect(workflow).not.toMatch(/secrets\.|^\s+environment:/m);
+    expect(workflow).toMatch(/^on:\n {2}pull_request:\n {2}push:\n/m);
+    expect(workflow).not.toContain("pull_request_target");
   });
 });
 
@@ -398,10 +391,12 @@ describe("Review workflow (independent reviewer)", () => {
   it("grants no default permission and only statuses: write per job", () => {
     expect(reviewWorkflow).toMatch(/^permissions: \{\}\n/m);
     expect(writeGrants(reviewWorkflow)).toEqual(["statuses: write", "statuses: write"]);
-    expect(reviewWorkflow).toMatch(/^ {4}permissions:\n {6}contents: read\n {6}pull-requests: read\n {6}statuses: write\n(?! {6})/m);
+    expect(reviewWorkflow).toMatch(/^ {4}permissions:\n {6}actions: read\n {6}contents: read\n {6}pull-requests: read\n {6}statuses: write\n(?! {6})/m);
   });
 
-  it("never runs PR code outside the verify job: no install, build, test or node step", () => {
+  it("never runs PR code: no install, build, test or node step in any job", () => {
+    const jobs = reviewWorkflow.slice(reviewWorkflow.indexOf("\njobs:\n"));
+    expect(jobs.match(/^ {2}[\w-]+:\n/gm)).toEqual(["  pass-through:\n", "  review:\n"]);
     for (const job of [jobOf(reviewWorkflow, "pass-through"), jobOf(reviewWorkflow, "review")]) {
       const blocks = runBlocks(job);
       expect(blocks.length).toBeGreaterThan(0);
@@ -414,17 +409,24 @@ describe("Review workflow (independent reviewer)", () => {
     expect(reviewWorkflow).not.toMatch(/uses: \.\//);
   });
 
-  it("reviews after verify, even when verify failed, but not for a cancelled run (story 6.2)", () => {
+  it("sets atlas-review to pending first, then waits (bounded) for the PR's ci run (story 6.2)", () => {
     const review = jobOf(reviewWorkflow, "review");
-    expect(review).toMatch(/^ {4}needs: verify\n/m);
-    expect(review).toMatch(/if: >-\n\s+!cancelled\(\) &&\n\s+startsWith\(github\.event\.pull_request\.head\.ref, 'atlas\/'\) &&\n/);
+    const firstStep = review.slice(review.indexOf("    steps:\n"));
+    expect(firstStep).toMatch(/^ {4}steps:\n {6}- name: Validate the PR and set atlas-review to pending\n/);
+    expect(review).not.toMatch(/^\s+needs:/m);
+    const wait = review.slice(review.indexOf("- name: Wait for ci on the PR head"), review.indexOf("- name: Validate the evidence"));
+    expect(wait).toContain("actions/workflows/ci.yml/runs?event=pull_request&head_sha=$HEAD_SHA");
+    expect(wait).toContain("deadline=$(( $(date +%s) + 30 * 60 ))");
+    expect(wait).toContain("GH_TOKEN: ${{ github.token }}");
+    // Fixed names and no symbolic link, checked before extraction.
+    expect(wait).toContain("grep -Evq '^(gates\\.json|vitest\\.json|e2e\\.json|shots/|shots/[A-Za-z0-9._-]+\\.png)$'");
+    expect(wait).toContain(`unzip -Z "$RUNNER_TEMP/atlas-proof.zip" | grep -q '^l'`);
+    expect(wait.indexOf("grep -Evq")).toBeLessThan(wait.indexOf('unzip -q -o "$RUNNER_TEMP/atlas-proof.zip"'));
+    expect(review).not.toContain("actions/download-artifact@");
   });
 
   it("hands the evidence to the reviewer as validated data only (story 6.2)", () => {
     const review = jobOf(reviewWorkflow, "review");
-    const download = review.indexOf("uses: actions/download-artifact@");
-    expect(download).toBeGreaterThan(review.indexOf("- name: Checkout the PR head as data"));
-    expect(review.slice(download)).toMatch(/^uses: actions\/download-artifact@[0-9a-f]{40} [^\n]*\n {8}with:\n {10}name: atlas-proof\n {10}path: \$\{\{ runner\.temp \}\}\/atlas-proof-raw\n/);
     const evidence = review.slice(review.indexOf("- name: Validate the evidence"), review.indexOf("- name: Install bubblewrap"));
     // Symbolic links or special files refuse the bundle; only JSON objects and real PNGs, size-capped, are copied.
     expect(evidence).toContain('find "$raw" \\( -type l -o \\( ! -type f ! -type d \\) \\) -print -quit');
@@ -432,7 +434,11 @@ describe("Review workflow (independent reviewer)", () => {
     expect(evidence).toContain('[ "$magic" != "89504e470d0a1a0a" ]');
     expect(evidence).toContain("max_json=$((5 * 1024 * 1024))");
     expect(evidence).toContain("max_png=$((5 * 1024 * 1024))");
-    expect(evidence).toContain("-f .github/atlas/proof-summary.jq > \"$dest/summary.json\"");
+    expect(evidence).toContain('"$(cat .github/atlas/named-tests.jq .github/atlas/proof-summary.jq)" > "$dest/summary.json"');
+    expect(evidence).toContain("awk -f .github/atlas/acceptance-criteria.awk .atlas-review/pr-body.md");
+    expect(evidence).toContain("max_shots=12");
+    // Changes that could bend the self-reported evidence are flagged for the reviewer.
+    expect(evidence).toContain('echo "package.json scripts changed"');
     // The summary is computed before the reviewer runs, which still only reads.
     expect(review.indexOf("- name: Validate the evidence")).toBeLessThan(review.indexOf("uses: anthropics/claude-code-action@"));
     expect(review).toContain('--allowedTools "Read,Glob,Grep"');

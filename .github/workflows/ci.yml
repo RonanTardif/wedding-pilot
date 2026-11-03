@@ -70,21 +70,30 @@ jobs:
           pnpm --version
 
       - name: Install
+        id: install
         run: pnpm install --frozen-lockfile
 
       - name: Lint
+        id: lint
         run: pnpm lint
 
       - name: Typecheck
+        id: typecheck
         run: pnpm typecheck
 
+      # The JSON report is part of the delivery evidence the ATLAS reviewer reads (story 6.2).
       - name: Unit tests
-        run: pnpm test
+        id: unit
+        run: |
+          mkdir -p "$RUNNER_TEMP/atlas-proof"
+          pnpm test --reporter=default --reporter=json "--outputFile.json=$RUNNER_TEMP/atlas-proof/vitest.json"
 
       - name: Architecture rules
+        id: arch
         run: pnpm arch
 
       - name: Build
+        id: build
         # The home page highlights a step from the current time: `/` must stay dynamic (never prerendered).
         run: |
           set -o pipefail
@@ -99,8 +108,59 @@ jobs:
         run: pnpm exec playwright install --with-deps chromium
 
       - name: Browser tests (Playwright e2e on the production build)
-        # playwright.config.ts starts `next start` on localhost:3100 against the build above.
+        id: e2e
+        # playwright.config.ts starts `next start` on localhost:3100 against the build above, writes
+        # test-results/e2e.json and, in CI, a viewport screenshot at the end of each browser test.
         run: pnpm test:e2e
+
+      # Story 6.2: the evidence the ATLAS reviewer (review.yml) downloads for a PR: gate outcomes, the Vitest and
+      # Playwright JSON reports and at most 12 viewport screenshots. Produced by the PR's own code, so the reviewer
+      # treats it as self-reported data; this job holds no secret and computes no verdict.
+      - name: Collect the delivery evidence
+        if: always()
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          INSTALL: ${{ steps.install.outcome }}
+          LINT: ${{ steps.lint.outcome }}
+          TYPECHECK: ${{ steps.typecheck.outcome }}
+          UNIT: ${{ steps.unit.outcome }}
+          ARCH: ${{ steps.arch.outcome }}
+          BUILD: ${{ steps.build.outcome }}
+          E2E: ${{ steps.e2e.outcome }}
+        run: |
+          set -uo pipefail
+          out="$RUNNER_TEMP/atlas-proof"
+          mkdir -p "$out/shots"
+          state() { case "$1" in success) echo passed ;; failure) echo failed ;; *) echo not_run ;; esac; }
+          jq -n --arg head_sha "$HEAD_SHA" \
+            --arg install "$(state "$INSTALL")" --arg lint "$(state "$LINT")" --arg typecheck "$(state "$TYPECHECK")" \
+            --arg test "$(state "$UNIT")" --arg arch "$(state "$ARCH")" --arg build "$(state "$BUILD")" \
+            --arg e2e "$(state "$E2E")" \
+            '{head_sha: $head_sha, gates: [
+               {name: "install", status: $install}, {name: "lint", status: $lint}, {name: "typecheck", status: $typecheck},
+               {name: "test", status: $test}, {name: "arch", status: $arch}, {name: "build", status: $build},
+               {name: "test:e2e", status: $e2e}]}' > "$out/gates.json"
+          if [ -f test-results/e2e.json ] && [ ! -L test-results/e2e.json ]; then cp test-results/e2e.json "$out/e2e.json"; fi
+          shots=0
+          if [ -d test-results/playwright ]; then
+            while IFS= read -r -d '' shot; do
+              [ "$shots" -lt 12 ] || break
+              # <test directory>.png: the directory names the test and its project.
+              name="$(printf '%s' "$(basename "$(dirname "$shot")")" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-100).png"
+              cp "$shot" "$out/shots/$name"
+              shots=$((shots + 1))
+            done < <(find test-results/playwright -mindepth 2 -maxdepth 2 -type f -name 'test-*.png' -print0 | sort -z)
+          fi
+          echo "Evidence: $(jq -c '[.gates[] | "\(.name)=\(.status)"]' "$out/gates.json"), $shots screenshot(s)"
+
+      - name: Upload the delivery evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: atlas-proof
+          path: ${{ runner.temp }}/atlas-proof/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Upload the Playwright report
         if: failure()

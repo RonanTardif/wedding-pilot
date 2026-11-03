@@ -8,7 +8,7 @@ name: deploy
 # which is exactly what the WIF provider accepts (pilot-bootstrap). Dispatching it on
 # any other ref is rejected at the auth step.
 #
-# Story 6.2: job `smoke` then replays the Playwright e2e suite against the public URL (synthetic traffic),
+# Story 6.2: job `smoke` then replays the Playwright tests tagged @smoke against the public URL (synthetic traffic),
 # without any cloud credential. A red smoke fails this run; the Factory reads the run (named after the
 # deployed SHA) and fails the build mission.
 run-name: deploy ${{ github.event.workflow_run.head_sha || github.sha }}
@@ -189,14 +189,15 @@ jobs:
       - name: Install Playwright Chromium
         run: pnpm exec playwright install --with-deps chromium
 
-      - name: Smoke test the public URL (Playwright e2e, synthetic traffic)
+      # Only the tests tagged @smoke: read-only checks (no form submission, no write) safe on the public page.
+      - name: Smoke test the public URL (Playwright @smoke tests, synthetic traffic)
         run: |
           if ! [[ "$E2E_BASE_URL" =~ ^https://[A-Za-z0-9.-]+$ ]]; then
             echo "::error::unexpected service URL '$E2E_BASE_URL'"
             exit 1
           fi
-          echo "Running the e2e suite against $E2E_BASE_URL"
-          pnpm test:e2e
+          echo "Running the @smoke e2e tests against $E2E_BASE_URL"
+          pnpm test:e2e --grep @smoke
 
       - name: Upload the Playwright report
         if: failure()
