@@ -10,10 +10,20 @@ name: review
 # Any other same-repo PR (human branch) gets atlas-review = success immediately: the agent review only
 # gates Factory PRs. Fork PRs get no status from this workflow.
 #
+# Story 6.2: the reviewer judges on evidence. Job `verify` runs the PR head's gates (lint, typecheck, unit
+# tests, architecture rules, build, Playwright e2e) and uploads the `atlas-proof` bundle: per-gate results,
+# the Vitest and Playwright JSON reports and the e2e screenshots. Job `review` validates it, computes the
+# acceptance coverage (each criterion of the PR body's mini-spec proved by a passing test named AC<n>) and
+# hands it to the reviewer under `.atlas-proof/`. An approval without full proof becomes a change request.
+#
 # Trust boundaries (pull_request_target runs with this repository's secrets):
-# - The workflow, the prompt and CLAUDE.md come from the base branch (main). The PR head is checked out
-#   into `.atlas-pr/` as data only, without credentials, stripped of instruction files and symlinks.
-# - No step runs PR code: no install, no build, no test (CI does that in `ci`, without secrets).
+# - Job `verify` is the only one that runs PR code: no secret, no environment, a read-only job token, a
+#   checkout of the PR head without credentials, egress limited to an allowlist (harden-runner, no
+#   Anthropic host), sudo and Docker removed before any PR script runs.
+# - In `review`, the workflow, the prompt and CLAUDE.md come from the base branch (main). The PR head is
+#   checked out into `.atlas-pr/` as data only, without credentials, stripped of instruction files and
+#   symlinks. No step of `review` runs PR code: the evidence arrives as data (JSON and PNG files only,
+#   size-capped, symbolic links refused) and is summarised with jq.
 # - The reviewer only has read tools; the verdict comes back as structured output and is posted by this
 #   workflow with the GitHub App token, minted after the agent has finished.
 on:
@@ -54,9 +64,150 @@ jobs:
             -f state=success -f context=atlas-review \
             -f description="Not an ATLAS branch: no agent review required" > /dev/null
 
+  verify:
+    name: verify
+    # Same ATLAS PRs as `review`. Runs the PR head's code: no secret, no environment, read-only token.
+    if: >-
+      startsWith(github.event.pull_request.head.ref, 'atlas/') &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      COREPACK_VERSION: 0.36.0
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      # First step: every later process (installs, gates, the server Playwright starts) can only reach these
+      # hosts (the build agent's allowlist without the Anthropic hosts); loopback stays open.
+      - name: Restrict network egress (harden-runner)
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            storage.googleapis.com:443
+            github.com:443
+            api.github.com:443
+            codeload.github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            *.actions.githubusercontent.com:443
+            *.blob.core.windows.net:443
+            registry.npmjs.org:443
+            nodejs.org:443
+            cdn.playwright.dev:443
+            playwright.download.prss.microsoft.com:443
+            archive.ubuntu.com:80
+            azure.archive.ubuntu.com:80
+            security.ubuntu.com:80
+            packages.microsoft.com:443
+            esm.ubuntu.com:443
+
+      - name: Checkout the PR head (no credentials)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Enable pnpm via corepack
+        run: |
+          npm install --global "corepack@${COREPACK_VERSION}"
+          corepack enable
+          pnpm --version
+
+      # No lifecycle script and no pnpmfile yet: no PR-controlled code runs while sudo is still available.
+      - name: Install dependencies (scripts off)
+        run: pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile
+
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Drop root and containers before the PR code runs
+        run: |
+          set -euo pipefail
+          # From here on every process runs PR code: no sudo, no Docker, so nothing can lift the egress block.
+          sudo systemctl stop docker.socket docker.service containerd.service > /dev/null 2>&1 || true
+          sudo rm -f /var/run/docker.sock /run/containerd/containerd.sock
+          sudo sh -c "sed -i -E '/^[[:space:]]*(runner|%sudo|%admin)[[:space:]]/d' /etc/sudoers && find /etc/sudoers.d -type f -delete"
+          if sudo -n true > /dev/null 2>&1; then
+            echo "::error::sudo is still available to the runner user"
+            exit 1
+          fi
+          echo "sudo and Docker are off for the rest of the job."
+
+      # Every gate runs, even after a failure, so the bundle tells the reviewer everything that is wrong.
+      - name: Run the gates and collect the evidence
+        id: gates
+        timeout-minutes: 30
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -uo pipefail
+          out="$RUNNER_TEMP/atlas-proof"
+          log="$RUNNER_TEMP/atlas-verify.log"
+          results="$RUNNER_TEMP/atlas-gates.ndjson"
+          rm -rf "$out" "$results" test-results playwright-report
+          mkdir -p "$out/shots"
+          failed=0
+          for gate in install lint typecheck test arch build test:e2e; do
+            case "$gate" in
+              install) cmd=(pnpm install --frozen-lockfile --offline) ;;
+              test) cmd=(pnpm test --reporter=default --reporter=json "--outputFile.json=$out/vitest.json") ;;
+              *) cmd=(pnpm "$gate") ;;
+            esac
+            echo "::group::pnpm $gate"
+            if "${cmd[@]}" > "$log" 2>&1; then status=passed; else status=failed; failed=1; fi
+            cat "$log"
+            echo "::endgroup::"
+            output=""
+            if [ "$status" = "failed" ]; then
+              echo "::error::gate pnpm $gate failed"
+              output="$(sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' "$log" | tail -c 20000)"
+            fi
+            jq -cn --arg name "$gate" --arg status "$status" --arg output "$output" \
+              '{name: $name, status: $status, output: (if $output == "" then null else $output end)}' >> "$results"
+          done
+          jq -s --arg head_sha "$HEAD_SHA" '{head_sha: $head_sha, gates: .}' "$results" > "$out/gates.json"
+          if [ -f test-results/e2e.json ] && [ ! -L test-results/e2e.json ]; then cp test-results/e2e.json "$out/e2e.json"; fi
+          shots=0
+          if [ -d test-results/playwright/shots ]; then
+            while IFS= read -r -d '' shot; do
+              name="$(basename "$shot")"
+              [[ "$name" =~ ^[A-Za-z0-9._-]+\.png$ ]] || continue
+              [ "$shots" -lt 30 ] || break
+              cp "$shot" "$out/shots/$name"
+              shots=$((shots + 1))
+            done < <(find test-results/playwright/shots -maxdepth 1 -type f -name '*.png' -print0 | sort -z)
+          fi
+          echo "Evidence: $(jq -c '[.gates[] | "\(.name)=\(.status)"]' "$out/gates.json"), $shots screenshot(s)"
+          echo "failed=$failed" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the evidence bundle
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: atlas-proof
+          path: ${{ runner.temp }}/atlas-proof/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Fail when a gate failed
+        if: steps.gates.outputs.failed != '0'
+        run: |
+          echo "::error::at least one gate failed on the PR head (see the evidence bundle)"
+          exit 1
+
   review:
     name: review
+    needs: verify
+    # Runs when verify failed too (the evidence says why), but not for a superseded, cancelled run.
     if: >-
+      !cancelled() &&
       startsWith(github.event.pull_request.head.ref, 'atlas/') &&
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
@@ -118,6 +269,15 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # Same run: no token needed. Data only, never executed; validated in the next steps.
+      - name: Get the verification evidence (data only)
+        id: evidence_download
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: atlas-proof
+          path: ${{ runner.temp }}/atlas-proof-raw
+
       - name: Prepare the review inputs
         id: prep
         env:
@@ -170,6 +330,88 @@ jobs:
 
           delimiter="ATLAS_PROMPT_$(openssl rand -hex 16)"
           { echo "prompt<<$delimiter"; cat .github/atlas/review-prompt.md; echo "$delimiter"; } >> "$GITHUB_OUTPUT"
+
+      - name: Validate the evidence and summarise it for the reviewer
+        id: evidence
+        env:
+          VERIFY_RESULT: ${{ needs.verify.result }}
+          DOWNLOAD_OUTCOME: ${{ steps.evidence_download.outcome }}
+        run: |
+          set -euo pipefail
+          raw="$RUNNER_TEMP/atlas-proof-raw"
+          dest=.atlas-proof
+          rm -rf "$dest"
+          mkdir -p "$dest/shots"
+          problems="$RUNNER_TEMP/atlas-proof-problems.txt"
+          : > "$problems"
+          max_json=$((5 * 1024 * 1024))
+          max_png=$((5 * 1024 * 1024))
+          max_total=$((60 * 1024 * 1024))
+          max_shots=30
+          total=0
+          shots=0
+          if [ "$DOWNLOAD_OUTCOME" != "success" ] || [ ! -d "$raw" ]; then
+            echo "verify uploaded no evidence bundle" >> "$problems"
+          elif [ -n "$(find "$raw" \( -type l -o \( ! -type f ! -type d \) \) -print -quit)" ]; then
+            echo "the evidence bundle contains symbolic links or special files: refused as a whole" >> "$problems"
+          else
+            # Only the expected names are kept: JSON reports and PNG screenshots, each size-capped.
+            while IFS= read -r -d '' file; do
+              rel="${file#"$raw"/}"
+              size="$(stat -c %s "$file")"
+              case "$rel" in
+                gates.json | vitest.json | e2e.json)
+                  if [ "$size" -gt "$max_json" ]; then
+                    echo "$rel is larger than 5 MB: dropped" >> "$problems"
+                  elif ! jq -e 'type == "object"' "$file" > /dev/null 2>&1; then
+                    echo "$rel is not a JSON object: dropped" >> "$problems"
+                  else
+                    cp "$file" "$dest/$rel"
+                    total=$((total + size))
+                  fi
+                  ;;
+                shots/*)
+                  name="${rel#shots/}"
+                  magic="$(head -c 8 "$file" | od -An -tx1 | tr -d ' \n')"
+                  if ! [[ "$name" =~ ^[A-Za-z0-9._-]+\.png$ ]]; then
+                    echo "screenshot with an unexpected name dropped" >> "$problems"
+                  elif [ "$magic" != "89504e470d0a1a0a" ]; then
+                    echo "shots/$name is not a PNG: dropped" >> "$problems"
+                  elif [ "$size" -gt "$max_png" ] || [ "$shots" -ge "$max_shots" ] || [ $((total + size)) -gt "$max_total" ]; then
+                    echo "shots/$name is over the size or count cap: dropped" >> "$problems"
+                  else
+                    cp "$file" "$dest/shots/$name"
+                    total=$((total + size))
+                    shots=$((shots + 1))
+                  fi
+                  ;;
+                *) echo "unexpected file dropped from the bundle" >> "$problems" ;;
+              esac
+            done < <(find "$raw" -type f -print0 | sort -z)
+          fi
+
+          # Acceptance criteria: the numbered list under `## Acceptance criteria` of the PR body's `## Mini-spec`
+          # section (written by build.yml; the last `## Mini-spec` heading wins), numbered AC1, AC2...
+          awk '
+            { sub(/\r$/, "") }
+            /^## Mini-spec[[:space:]]*$/ { m = 1; a = 0; n = 0; next }
+            m && /^## Acceptance criteria/ { a = 1; next }
+            m && a && (/^## / || /^---[[:space:]]*$/) { a = 0 }
+            m && a && /^[0-9]+\. / { sub(/^[0-9]+\. /, ""); c[++n] = $0 }
+            END { for (i = 1; i <= n; i++) print c[i] }
+          ' .atlas-review/pr-body.md | jq -R . | jq -s . > "$RUNNER_TEMP/atlas-criteria.json"
+          for report in gates vitest e2e; do
+            if [ -f "$dest/$report.json" ]; then cp "$dest/$report.json" "$RUNNER_TEMP/atlas-$report.json"; else echo null > "$RUNNER_TEMP/atlas-$report.json"; fi
+          done
+          find "$dest/shots" -type f -name '*.png' | sort | jq -R . | jq -s . > "$RUNNER_TEMP/atlas-shots.json"
+          jq -R . < "$problems" | jq -s . > "$RUNNER_TEMP/atlas-problems.json"
+
+          jq -n --arg head_sha "$HEAD_SHA" --arg verify "$VERIFY_RESULT" \
+            --slurpfile criteria "$RUNNER_TEMP/atlas-criteria.json" --slurpfile gates "$RUNNER_TEMP/atlas-gates.json" \
+            --slurpfile unit "$RUNNER_TEMP/atlas-vitest.json" --slurpfile e2e "$RUNNER_TEMP/atlas-e2e.json" \
+            --slurpfile shots "$RUNNER_TEMP/atlas-shots.json" --slurpfile problems "$RUNNER_TEMP/atlas-problems.json" \
+            -f .github/atlas/proof-summary.jq > "$dest/summary.json"
+          jq -r '"Evidence: proved=\(.proved); " + ((.reasons | join("; ")) | if . == "" then "nothing missing" else . end)' "$dest/summary.json"
 
       - name: Install bubblewrap and socat (Claude Code sandbox dependencies)
         run: sudo apt-get update -q && sudo apt-get install -y -q bubblewrap socat
@@ -227,11 +469,31 @@ jobs:
             exit 1
           fi
 
+          # Story 6.2: the evidence decides in code too. An approval without full proof becomes a change request.
+          proof=.atlas-proof/summary.json
+          if ! jq -e 'type == "object" and (.reasons | type) == "array"' "$proof" > /dev/null 2>&1; then
+            jq -n '{proved: false, reasons: ["no evidence summary"]}' > "$RUNNER_TEMP/atlas-no-proof.json"
+            proof="$RUNNER_TEMP/atlas-no-proof.json"
+          fi
+          if [ "$verdict" = "approve" ] && ! jq -e '.proved == true' "$proof" > /dev/null; then
+            REVIEW_JSON="$(jq -c --slurpfile p "$proof" '.verdict = "request_changes"
+              | .summary += "\n\n**Not approved by the workflow:** the delivery is not proved (" + ($p[0].reasons | join("; ")) + ")."' <<< "$REVIEW_JSON")"
+            verdict=request_changes
+            echo "::warning::the reviewer approved without full proof: changed to request_changes"
+          fi
+          evidence_line="$(jq -r '
+            def n($x): if $x == null then "?" else ($x | tostring) end;
+            "**Evidence** (verify job on this head): unit tests \(n(.unit.passed)) passed / \(n(.unit.failed)) failed, "
+            + "e2e \(n(.e2e.passed)) passed / \(n(.e2e.failed)) failed, "
+            + "acceptance criteria \(n(.acceptance.covered))/\(n(.acceptance.criteria)) covered, "
+            + "\((.screenshots // []) | length) screenshot(s)."
+            + (if (.reasons | length) > 0 then " Missing: " + (.reasons | join("; ")) + "." else "" end)' "$proof")"
+
           # Review body: verdict, summary, then the comments (inline ones are also attached to their line).
           render_body() { # $1 = all | not-inline
-            jq -r --arg mode "$1" --arg run_url "$run_url" '
+            jq -r --arg mode "$1" --arg run_url "$run_url" --arg evidence "$evidence_line" '
               "**ATLAS review: " + (if .verdict == "approve" then "approve" else "changes requested" end)
-              + "** ([review run](" + $run_url + "))\n\n" + .summary
+              + "** ([review run](" + $run_url + "))\n\n" + .summary + "\n\n" + $evidence
               + ( [ .comments[] | select($mode == "all" or (.line == null)) ]
                   | if length == 0 then ""
                     else "\n\n### Comments\n\n" + (map("- `" + .path + (if .line then ":" + (.line | tostring) else "" end) + "`: " + .body) | join("\n"))
