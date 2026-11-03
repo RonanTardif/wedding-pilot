@@ -202,19 +202,35 @@ describe("Build workflow (Factory code agent)", () => {
     const missionId = buildWorkflow.indexOf('[[ "$MISSION_ID" =~ ^msn_[0-9A-HJKMNP-TV-Z]{26}$ ]]');
     expect(runId).toBeGreaterThan(0);
     expect(missionId).toBeGreaterThan(0);
+    // Only the egress block (harden-runner) comes first; every other action runs after the ids are valid.
     const firstUses = buildWorkflow.indexOf("uses:");
-    expect(runId).toBeLessThan(firstUses);
-    expect(missionId).toBeLessThan(firstUses);
+    expect(buildWorkflow.slice(firstUses)).toMatch(/^uses: step-security\/harden-runner@[0-9a-f]{40} /);
+    const secondUses = buildWorkflow.indexOf("uses:", firstUses + 1);
+    expect(runId).toBeLessThan(secondUses);
+    expect(missionId).toBeLessThan(secondUses);
   });
 
-  it("limits the agent to file tools and the pnpm quality scripts", () => {
-    const allowed = /--allowedTools "([^"]+)"/.exec(buildWorkflow)?.[1] ?? "";
-    const tools = allowed.split(",");
-    expect(tools.length).toBeGreaterThan(0);
-    for (const tool of tools) {
-      expect(tool).toMatch(/^(Read|Glob|Grep|Edit|MultiEdit|Write|TodoWrite|Bash\(pnpm (lint|typecheck|test|test:\*|arch|build)\))$/);
+  it("gives the agent a free shell only inside an egress block, without root, Docker or WebFetch (story 6.1)", () => {
+    const allowedLists = [...buildWorkflow.matchAll(/--allowedTools "([^"]+)"/g)].map((m) => m[1] ?? "");
+    expect(allowedLists).toHaveLength(2);
+    for (const allowed of allowedLists) {
+      expect(allowed.split(",").sort()).toEqual(["Bash", "Edit", "Glob", "Grep", "MultiEdit", "Read", "TodoWrite", "WebSearch", "Write"]);
     }
+    const disallowedLists = [...buildWorkflow.matchAll(/--disallowedTools "([^"]+)"/g)].map((m) => m[1] ?? "");
+    expect(disallowedLists).toHaveLength(2);
+    for (const disallowed of disallowedLists) expect(disallowed.split(",")).toContain("WebFetch");
     expect(buildWorkflow).toContain('CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"');
+    // The egress block is the agent job's first step, in block mode.
+    const agentJob = buildWorkflow.slice(buildWorkflow.indexOf("\n  agent:\n"), buildWorkflow.indexOf("\n  publish:\n"));
+    const firstStep = agentJob.slice(agentJob.indexOf("    steps:\n"));
+    expect(firstStep).toMatch(/^ {4}steps:\n(?: {6}#[^\n]*\n)* {6}- name: [^\n]+\n {8}uses: step-security\/harden-runner@[0-9a-f]{40} [^\n]*\n {8}with:\n {10}egress-policy: block\n/);
+    // sudo and Docker are gone before the agent runs, and the step fails if sudo still works.
+    const drop = agentJob.indexOf("- name: Drop root and containers before the agent runs");
+    expect(drop).toBeGreaterThan(-1);
+    expect(drop).toBeLessThan(agentJob.indexOf("uses: anthropics/claude-code-action@"));
+    expect(agentJob).toContain("rm -f /var/run/docker.sock");
+    expect(agentJob).toContain('if sudo -n true > /dev/null 2>&1; then');
+    expect(agentJob.slice(agentJob.indexOf("uses: anthropics/claude-code-action@"))).not.toMatch(/\bsudo\b/);
   });
 
   it("runs the agent in a job with no App secret and no environment; only publish gets them", () => {
@@ -246,8 +262,10 @@ describe("Build workflow (Factory code agent)", () => {
     const runner = buildWorkflow.indexOf('cat > "$RUNNER_TEMP/atlas-gates.sh"');
     expect(runner).toBeGreaterThan(-1);
     expect(runner).toBeLessThan(buildWorkflow.indexOf("uses: anthropics/claude-code-action@"));
-    expect(buildWorkflow).toContain("for gate in lint typecheck test arch build; do");
-    expect(buildWorkflow).toContain('if ! pnpm "$gate" > "$log" 2>&1; then');
+    expect(buildWorkflow).toContain("for gate in install lint typecheck test arch build test:e2e acceptance; do");
+    expect(buildWorkflow).toContain('if ! run > "$log" 2>&1; then');
+    // The agent's shell can write under $RUNNER_TEMP: the runner's hash is checked before each of its two runs.
+    expect(buildWorkflow.match(/\/usr\/bin\/sha256sum --check --status/g)?.length).toBeGreaterThanOrEqual(3);
     // Final check after the (optional) repair run, before any App token.
     const finalGates = buildWorkflow.indexOf("- name: Verify the quality gates after the repair");
     expect(finalGates).toBeGreaterThan(buildWorkflow.indexOf("id: agent_fix"));
@@ -343,7 +361,7 @@ describe("Every workflow action is pinned by commit SHA", () => {
     ["review.yml", reviewWorkflow],
   ] as const) {
     it(name, () => {
-      const uses = [...content.matchAll(/^\s*(?:-\s+)?uses:\s*(\S+)/gm)].map((m) => m[1]);
+      const uses = [...content.matchAll(/^\s*(?:-\s+)?uses:\s*(\S+)/gm)].map((m) => m[1] ?? "");
       expect(uses.length).toBeGreaterThan(0);
       for (const ref of uses) {
         expect(ref).toMatch(/^[\w.-]+\/[\w.-]+@[0-9a-f]{40}$/);

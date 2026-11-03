@@ -11,3 +11,5 @@ next-env.d.ts
 *.tfplan
 *.tfstate
 *.tfstate.*
+test-results/
+playwright-report/

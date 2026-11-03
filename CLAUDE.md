@@ -30,17 +30,18 @@ Each bounded context lives in `src/<context>/` with exactly these layers:
 
 - Domain and application logic get unit tests (Vitest) **without infrastructure**: no network, no GCP, no Next.js runtime; use in-memory adapters.
 - Place tests next to the code (`*.test.ts`) or under `tests/`.
+- Browser tests: Playwright, `tests/e2e/*.e2e.ts`, run by `pnpm test:e2e` against the production build (`pnpm build` first) on `localhost:3100` with the `x-atlas-traffic: synthetic` header.
 - `tests/architecture/` proves the dependency rules bite; its `fixtures/` are deliberately broken and excluded from `lint`, `typecheck` and `arch`.
 
 ## Workflow
 
 - Branch name for Factory runs: `atlas/{run_id}/{mission_id}`. Never push to `main`; open a PR.
-- Before pushing: `pnpm lint && pnpm typecheck && pnpm test && pnpm arch && pnpm build`.
+- Before pushing: `pnpm lint && pnpm typecheck && pnpm test && pnpm arch && pnpm build && pnpm test:e2e` (Playwright: `pnpm exec playwright install chromium` once).
 - Toolchain is pinned (Node 26, pnpm 12.16.1 via corepack, exact dependency versions). Use `pnpm install --frozen-lockfile` and commit `pnpm-lock.yaml` with any dependency change.
 
 ## Factory builds and reviews
 
-- **Build** (`.github/workflows/build.yml`, prompt `.github/atlas/build-prompt.md`): the Factory dispatches it on `main` with `run_id`, `mission_id`, `intent`, `mini_spec` and, on a retry, `feedback`. The inputs are in `.atlas-run/` (`intent.md`, `mini-spec.md`, `feedback.md`); the build agent works in the checkout of `atlas/{run_id}/{mission_id}` (the existing branch on a retry), with file tools and the `pnpm` quality scripts only: no git, no network, no package install. The workflow re-runs the gates, then commits, pushes and opens or updates the PR `[{run_id}] …`.
+- **Build** (`.github/workflows/build.yml`, prompt `.github/atlas/build-prompt.md`): the Factory dispatches it on `main` with `run_id`, `mission_id`, `intent`, `mini_spec` and, on a retry, `feedback`. The inputs are in `.atlas-run/` (`intent.md`, `mini-spec.md`, `feedback.md`); the build agent works in the checkout of `atlas/{run_id}/{mission_id}` (the existing branch on a retry), with file tools, a free shell and `WebSearch` (no `WebFetch`, no git write), network limited to an allowlist by harden-runner. It may add exact-version dependencies and proves every mini-spec acceptance criterion with a test named after it. The workflow re-runs the six gates, then commits, pushes and opens or updates the PR `[{run_id}] …`.
 - A build agent never changes `.github/**` (the push is refused) and avoids the CODEOWNERS paths below unless the mini-spec requires them: they block the automatic merge.
 - **Review** (`.github/workflows/review.yml`, prompt `.github/atlas/review-prompt.md`): every PR from an `atlas/` branch gets a second, independent agent with read-only tools. Its instructions (this file, the prompt) come from `main`, never from the PR. Its verdict sets the required status `atlas-review`; on approval the GitHub App enables auto-merge (squash), so the PR merges once `ci` and `atlas-review` pass, then `deploy.yml` ships it. A PR touching a CODEOWNERS path is not auto-merged: Ronan reviews it.
 
