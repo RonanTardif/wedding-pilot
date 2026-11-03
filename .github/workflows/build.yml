@@ -12,9 +12,10 @@ name: build
 #
 # Trust boundaries:
 # - Dispatch inputs reach the agent only as files under `.atlas-run/` (never interpolated into a shell).
-# - Job `agent` runs everything agent-controlled (the agent, the pnpm gates, git in its workspace). It has
-#   no GitHub App secret and no environment; its GitHub token is the read-only job token. It hands over
-#   a patch, the changed-file list and the usage as an artifact.
+# - Job `agent` runs everything agent-controlled (the agent with a free shell and WebSearch, the six pnpm
+#   gates including Playwright e2e, git in its workspace). It has no GitHub App secret and no environment;
+#   its GitHub token is the read-only job token; harden-runner blocks egress outside a closed allowlist
+#   (story 6.1). WebFetch stays disallowed. It hands over a patch, the changed-file list and the usage.
 # - Job `publish` (environment `atlas-agents`) runs no agent-controlled code: it re-checks the patch,
 #   mints the App token, applies the patch in a fresh clone, pushes and opens or updates the PR.
 # - The App has no `workflows` permission: a change under `.github/` is refused before the push.
@@ -62,7 +63,7 @@ jobs:
     name: agent
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     permissions:
       contents: read
     outputs:
@@ -76,6 +77,35 @@ jobs:
       output_tokens: ${{ steps.tokens.outputs.output_tokens || steps.usage.outputs.output_tokens }}
       changes_ok: ${{ steps.changes.outcome == 'success' }}
     steps:
+      # First step: every later process of the job (the agent, its shell, the gates, the server Playwright
+      # starts) can only reach the hosts below; loopback stays open. Blocked calls are annotated in the run.
+      - name: Restrict network egress (harden-runner)
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.anthropic.com:443
+            statsig.anthropic.com:443
+            claude.ai:443
+            downloads.claude.ai:443
+            storage.googleapis.com:443
+            github.com:443
+            api.github.com:443
+            codeload.github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            *.actions.githubusercontent.com:443
+            *.blob.core.windows.net:443
+            registry.npmjs.org:443
+            nodejs.org:443
+            cdn.playwright.dev:443
+            playwright.download.prss.microsoft.com:443
+            archive.ubuntu.com:80
+            azure.archive.ubuntu.com:80
+            security.ubuntu.com:80
+            packages.microsoft.com:443
+            esm.ubuntu.com:443
+
       - name: Validate ids and write the mission inputs to files
         id: inputs
         env:
@@ -157,6 +187,12 @@ jobs:
           esac
           cp -R "$RUNNER_TEMP/atlas-input" .atlas-run
           echo ".atlas-run/" >> .git/info/exclude
+          # The tree the agent starts from: the change is always collected against it, even if the agent's
+          # shell moved HEAD (a commit, a checkout) during the run.
+          echo "work_head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          # Pristine .git/config, restored before collecting: the agent's shell could add filters or aliases.
+          cp .git/config "$RUNNER_TEMP/atlas-git-config"
+          echo "git_config_sha=$(sha256sum .git/config | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       - name: Setup Node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -172,23 +208,68 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
 
+      - name: Install Playwright Chromium (e2e gate and the agent's browser checks)
+        run: pnpm exec playwright install --with-deps chromium
+
       - name: Install bubblewrap and socat (Claude Code sandbox dependencies)
         run: sudo apt-get update -q && sudo apt-get install -y -q bubblewrap socat
 
       - name: Write the gate runner
+        id: gates_script
+        env:
+          MAIN_SHA: ${{ steps.prepare.outputs.main_sha }}
         run: |
-          # Outside the workspace: the agent cannot edit it. Runs the gates one by one; on the first failure it
-          # writes the failing gate and its full output (ANSI stripped) to $RUNNER_TEMP/atlas-gate-failure.md.
+          set -euo pipefail
+          # Written before the agent runs; its SHA-256 is a step output, checked before every use (the agent's
+          # free shell can write under $RUNNER_TEMP). The PR's own `ci` run stays the authoritative gate.
+          # The number of acceptance criteria is read here, from the mini-spec the workflow wrote.
+          ac_count="$(awk '/^## Acceptance criteria/{f=1;next} /^## /{f=0} f && /^[0-9]+\. /{c++} END{print c+0}' .atlas-run/mini-spec.md)"
           cat > "$RUNNER_TEMP/atlas-gates.sh" <<'GATES'
           #!/usr/bin/env bash
+          # Gates, in order: frozen install (node_modules matches the lockfile), lint, typecheck, test, arch,
+          # build, test:e2e, then the acceptance check (one test named AC<n> per criterion, in the tests this
+          # branch adds or changes). On the first failure it writes the failing gate and its full output
+          # (ANSI stripped) to $RUNNER_TEMP/atlas-gate-failure.md.
           set -uo pipefail
           log="$RUNNER_TEMP/atlas-gate.log"
           rm -f "$RUNNER_TEMP/atlas-gate-failure.md"
-          for gate in lint typecheck test arch build; do
-            if ! pnpm "$gate" > "$log" 2>&1; then
+          # Leftovers of the agent's own runs: reports linted as code, a server holding the e2e port.
+          rm -rf test-results playwright-report
+          pkill -f "next start" > /dev/null 2>&1 || true
+          fuser -k 3100/tcp > /dev/null 2>&1 || true
+          check_acceptance() {
+            if [ "$AC_COUNT" -lt 1 ]; then
+              echo "The mini-spec has no numbered acceptance criteria under '## Acceptance criteria'."
+              return 1
+            fi
+            local files=() f i missing=()
+            while IFS= read -r f; do
+              [ -f "$f" ] && files+=("$f")
+            done < <({ git -c core.hooksPath=/dev/null diff --name-only "$MAIN_SHA"; git ls-files --others --exclude-standard; } \
+                     | sort -u | grep -E '\.(test|spec|e2e)\.tsx?$' || true)
+            for i in $(seq 1 "$AC_COUNT"); do
+              if [ "${#files[@]}" -eq 0 ] || ! grep -qE "(test|it)(\.[a-z]+)?\([[:space:]]*[\"'\`]AC-?${i}([^0-9]|\$)" "${files[@]}"; then
+                missing+=("AC$i")
+              fi
+            done
+            if [ "${#missing[@]}" -gt 0 ]; then
+              echo "No test added or changed by this branch is named after: ${missing[*]}."
+              echo "Name each test after the criterion it proves, e.g. test(\"AC1: ...\") or it(\"AC2: ...\")."
+              echo "Test files added or changed: ${files[*]:-none}"
+              return 1
+            fi
+            echo "Each of the $AC_COUNT acceptance criteria has a named test."
+          }
+          for gate in install lint typecheck test arch build test:e2e acceptance; do
+            case "$gate" in
+              install) label="pnpm install --frozen-lockfile --offline"; run() { pnpm install --frozen-lockfile --offline; } ;;
+              acceptance) label="acceptance check"; run() { check_acceptance; } ;;
+              *) label="pnpm $gate"; run() { pnpm "$gate"; } ;;
+            esac
+            if ! run > "$log" 2>&1; then
               cat "$log"
               {
-                echo "The quality gate \`pnpm $gate\` failed. Its full output:"
+                echo "The quality gate \`$label\` failed. Its full output:"
                 echo
                 echo '```'
                 # Full output (ANSI stripped); only a safety cap far above any real gate log.
@@ -200,7 +281,25 @@ jobs:
             cat "$log"
           done
           GATES
+          sed -i -e "s/^set -uo pipefail$/set -uo pipefail\nAC_COUNT=${ac_count}\nMAIN_SHA=${MAIN_SHA}/" "$RUNNER_TEMP/atlas-gates.sh"
           chmod +x "$RUNNER_TEMP/atlas-gates.sh"
+          echo "sha=$(sha256sum "$RUNNER_TEMP/atlas-gates.sh" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "Gate runner written ($ac_count acceptance criteria)."
+
+      - name: Drop root and containers before the agent runs
+        run: |
+          set -euo pipefail
+          # From here on, every process is agent-controlled or runs agent-written code: no sudo, no Docker, so
+          # nothing can lift the egress block or read other processes' memory as root.
+          sudo systemctl stop docker.socket docker.service containerd.service > /dev/null 2>&1 || true
+          sudo rm -f /var/run/docker.sock /run/containerd/containerd.sock
+          # One sudo call: the runner's own entry is removed last.
+          sudo sh -c "sed -i -E '/^[[:space:]]*(runner|%sudo|%admin)[[:space:]]/d' /etc/sudoers && find /etc/sudoers.d -type f -delete"
+          if sudo -n true > /dev/null 2>&1; then
+            echo "::error::sudo is still available to the runner user"
+            exit 1
+          fi
+          echo "sudo and Docker are off for the rest of the job."
 
       - name: Run the code agent (Claude Code, subscription)
         id: agent
@@ -217,9 +316,9 @@ jobs:
           # Full transcript in the log: failures must be diagnosable (Ronan, 2026-11-01).
           show_full_output: true
           claude_args: |
-            --max-turns 150
-            --allowedTools "Read,Glob,Grep,Edit,MultiEdit,Write,TodoWrite,Bash(pnpm lint),Bash(pnpm typecheck),Bash(pnpm test),Bash(pnpm test:*),Bash(pnpm arch),Bash(pnpm build)"
-            --disallowedTools "WebFetch,WebSearch,NotebookEdit"
+            --max-turns 250
+            --allowedTools "Read,Glob,Grep,Edit,MultiEdit,Write,TodoWrite,Bash,WebSearch"
+            --disallowedTools "WebFetch,NotebookEdit"
 
       - name: Classify the agent run and count tokens
         id: usage
@@ -273,7 +372,12 @@ jobs:
         id: gates_first
         if: steps.usage.outputs.agent_status == 'succeeded'
         continue-on-error: true
-        run: '"$RUNNER_TEMP/atlas-gates.sh"'
+        env:
+          GATES_SHA: ${{ steps.gates_script.outputs.sha }}
+        run: |
+          echo "$GATES_SHA  $RUNNER_TEMP/atlas-gates.sh" | /usr/bin/sha256sum --check --status \
+            || { echo "::error::the gate runner was modified during the run"; exit 1; }
+          /usr/bin/bash "$RUNNER_TEMP/atlas-gates.sh"
 
       - name: Hand the failing gate back to the agent
         id: repair_input
@@ -285,8 +389,9 @@ jobs:
             if [ -s .atlas-run/feedback.md ]; then cat .atlas-run/feedback.md; echo; echo "---"; echo; fi
             echo "## Quality gates after your work in this run"
             echo
-            echo "The workflow ran the gates on your current working tree and one failed. Fix it, then run all five"
-            echo "gates again (\`pnpm lint\`, \`pnpm typecheck\`, \`pnpm test\`, \`pnpm arch\`, \`pnpm build\`) after your last edit."
+            echo "The workflow ran the gates on your current working tree and one failed. Fix it, then run all the"
+            echo "gates again (\`pnpm lint\`, \`pnpm typecheck\`, \`pnpm test\`, \`pnpm arch\`, \`pnpm build\`, \`pnpm test:e2e\`)"
+            echo "after your last edit, keep the lockfile in sync and name a test after each acceptance criterion (AC1, AC2...)."
             echo
             cat "$RUNNER_TEMP/atlas-gate-failure.md"
           } > "$RUNNER_TEMP/atlas-feedback.md"
@@ -307,9 +412,9 @@ jobs:
           # Full transcript in the log: failures must be diagnosable (Ronan, 2026-11-01).
           show_full_output: true
           claude_args: |
-            --max-turns 80
-            --allowedTools "Read,Glob,Grep,Edit,MultiEdit,Write,TodoWrite,Bash(pnpm lint),Bash(pnpm typecheck),Bash(pnpm test),Bash(pnpm test:*),Bash(pnpm arch),Bash(pnpm build)"
-            --disallowedTools "WebFetch,WebSearch,NotebookEdit"
+            --max-turns 120
+            --allowedTools "Read,Glob,Grep,Edit,MultiEdit,Write,TodoWrite,Bash,WebSearch"
+            --disallowedTools "WebFetch,NotebookEdit"
 
       - name: Count the tokens of the repair run
         id: tokens
@@ -340,12 +445,18 @@ jobs:
         continue-on-error: true
         env:
           FIRST: ${{ steps.gates_first.outcome }}
+          GATES_SHA: ${{ steps.gates_script.outputs.sha }}
         run: |
           if [ "$FIRST" = "success" ]; then
             echo "The gates passed on the first check."
             exit 0
           fi
-          if ! "$RUNNER_TEMP/atlas-gates.sh"; then
+          if ! echo "$GATES_SHA  $RUNNER_TEMP/atlas-gates.sh" | /usr/bin/sha256sum --check --status; then
+            echo "The gate runner was modified during the run." > "$RUNNER_TEMP/atlas-out/reason.txt"
+            echo "::error::the gate runner was modified during the run"
+            exit 1
+          fi
+          if ! /usr/bin/bash "$RUNNER_TEMP/atlas-gates.sh"; then
             { echo "The quality gates still failed after the agent's repair run."; echo; cat "$RUNNER_TEMP/atlas-gate-failure.md"; } \
               > "$RUNNER_TEMP/atlas-out/reason.txt"
             exit 1
@@ -355,12 +466,30 @@ jobs:
         id: changes
         if: steps.gates.outcome == 'success'
         continue-on-error: true
+        env:
+          WORK_HEAD: ${{ steps.prepare.outputs.work_head }}
+          GIT_CONFIG_SHA: ${{ steps.prepare.outputs.git_config_sha }}
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/atlas-out"
           # Hooks and fsmonitor are disabled: the workspace is agent-controlled.
           safe_git() { git -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"; }
           rm -rf .atlas-run
+          if ! [[ "$WORK_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::missing work_head from the prepare step"
+            exit 1
+          fi
+          # The pristine .git/config (no filter, alias or hook path the agent may have added); no attributes file.
+          if ! echo "$GIT_CONFIG_SHA  $RUNNER_TEMP/atlas-git-config" | /usr/bin/sha256sum --check --status; then
+            echo "The saved git configuration was modified during the run." > "$out/reason.txt"
+            echo "::error::the saved git configuration was modified"
+            exit 1
+          fi
+          cp "$RUNNER_TEMP/atlas-git-config" .git/config
+          rm -f .git/info/attributes
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+          # Back to the starting commit, keeping the working tree: commits made by the agent become plain changes.
+          safe_git reset --quiet --soft "$WORK_HEAD"
           safe_git add -A
           # Against HEAD: the branch head, or its merge with main (recreated by publish).
           safe_git diff --cached --name-only --no-renames -z HEAD | tr '\0' '\n' > "$out/changed.txt"
