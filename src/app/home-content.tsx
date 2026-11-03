@@ -4,6 +4,7 @@ import { DayProgramme } from "../event-programme/adapters/inbound/day-programme"
 import type { ListedVenue } from "../venues/application/list-venues";
 import { VenueList } from "../venues/adapters/inbound/venue-list";
 import { UsageBeacon } from "../usage-analytics/adapters/inbound/usage-beacon";
+import { BridesPitch } from "./brides-pitch";
 
 /** Venue display names by id: the only thing the programme learns about venues. */
 export function buildVenueNameById(venues: readonly ListedVenue[] | null): ReadonlyMap<string, string> {
@@ -26,6 +27,7 @@ export function HomeContent({
   return (
     <>
       <main>
+        <BridesPitch />
         {programme ? (
           <DayProgramme programme={programme} venueNameById={buildVenueNameById(venues)} />
         ) : (
